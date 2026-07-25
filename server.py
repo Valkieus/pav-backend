@@ -1337,7 +1337,10 @@ async def get_planning_by_month(annee: int, mois: int, current_user: dict = Depe
 
 @api_router.post("/planning", response_model=PlanningResponse)
 async def create_planning(data: PlanningCreate, current_user: dict = Depends(get_current_user)):
-    check_access(current_user, ["Super Admin", "Admin", "Responsable"])
+    # Gestionnaire is included so they can save the Absences/Notes fields they're
+    # allowed to edit in the web Planning; the UI itself keeps the affectation
+    # grid cells read-only for anyone below Responsable.
+    check_access(current_user, ["Super Admin", "Admin", "Responsable", "Gestionnaire"])
     existing = await db.planning.find_one({"annee": data.annee, "mois": data.mois, "is_archived": False})
     if existing:
         raise HTTPException(status_code=400, detail="Un planning existe déjà pour ce mois")
@@ -1361,7 +1364,9 @@ async def create_planning(data: PlanningCreate, current_user: dict = Depends(get
 
 @api_router.put("/planning/{planning_id}", response_model=PlanningResponse)
 async def update_planning(planning_id: str, data: PlanningCreate, current_user: dict = Depends(get_current_user)):
-    check_access(current_user, ["Super Admin", "Admin", "Responsable"])
+    # Same rationale as create_planning above: Gestionnaire needs to be able
+    # to save after editing Absences/Notes.
+    check_access(current_user, ["Super Admin", "Admin", "Responsable", "Gestionnaire"])
     update_data = {
         "dates": data.dates,
         "affectations": data.affectations,
