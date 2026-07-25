@@ -99,9 +99,29 @@ class UserResponse(BaseModel):
     full_name: str
     niveau_acces: str
     branches: Optional[List[str]] = []
+    technicien_id: Optional[str] = None
     created_at: str
     is_active: bool
     must_change_password: Optional[bool] = False
+
+class RegisterRequest(BaseModel):
+    technicien_id: str
+    username: str
+    password: str
+
+class AbsenceCreate(BaseModel):
+    date_debut: str  # YYYY-MM-DD
+    date_fin: str    # YYYY-MM-DD
+    raison: str
+
+class AbsenceResponse(BaseModel):
+    id: str
+    user_id: str
+    full_name: str
+    date_debut: str
+    date_fin: str
+    raison: str
+    created_at: str
 
 class TokenResponse(BaseModel):
     access_token: str
@@ -742,6 +762,7 @@ async def login(data: UserLogin):
             full_name=user['full_name'],
             niveau_acces=user['niveau_acces'],
             branches=user.get('branches', []),
+            technicien_id=user.get('technicien_id'),
             created_at=user['created_at'],
             is_active=user.get('is_active', True)
         )
@@ -755,6 +776,7 @@ async def get_me(current_user: dict = Depends(get_current_user)):
         full_name=current_user['full_name'],
         niveau_acces=current_user['niveau_acces'],
         branches=current_user.get('branches', []),
+        technicien_id=current_user.get('technicien_id'),
         created_at=current_user['created_at'],
         is_active=current_user.get('is_active', True),
         must_change_password=current_user.get('must_change_password', False)
@@ -891,6 +913,64 @@ async def update_user_access(user_id: str, niveau_acces: str, current_user: dict
         raise HTTPException(status_code=404, detail="Utilisateur non trouvé")
     await log_action(current_user['id'], current_user['full_name'], "Changement niveau accès", f"Niveau changé pour {user_id}: {niveau_acces}")
     return {"message": "Niveau d'accès mis à jour"}
+
+# ==================== SELF-REGISTRATION ====================
+# Lets a technicien already listed in the Effectif create their own login
+# without a Super Admin having to do it. They pick their name from the list
+# of techniciens that don't have an account yet, then set their own password.
+# This is intentionally public (no auth) since it runs before login.
+
+@api_router.get("/techniciens/unclaimed")
+async def get_unclaimed_techniciens():
+    techniciens = await db.techniciens.find({"is_archived": False}, {"_id": 0, "id": 1, "nom": 1, "prenom": 1}).sort("nom", 1).to_list(1000)
+    claimed_ids = set()
+    async for u in db.users.find({"technicien_id": {"$ne": None}}, {"_id": 0, "technicien_id": 1}):
+        claimed_ids.add(u.get("technicien_id"))
+    return [t for t in techniciens if t["id"] not in claimed_ids]
+
+@api_router.post("/auth/register", response_model=TokenResponse)
+async def register(data: RegisterRequest):
+    technicien = await db.techniciens.find_one({"id": data.technicien_id, "is_archived": False}, {"_id": 0})
+    if not technicien:
+        raise HTTPException(status_code=404, detail="Technicien introuvable")
+
+    already_claimed = await db.users.find_one({"technicien_id": data.technicien_id})
+    if already_claimed:
+        raise HTTPException(status_code=400, detail="Un compte existe déjà pour ce technicien")
+
+    existing_username = await db.users.find_one({"username": data.username})
+    if existing_username:
+        raise HTTPException(status_code=400, detail="Nom d'utilisateur déjà pris")
+
+    if len(data.password) < 6:
+        raise HTTPException(status_code=400, detail="Le mot de passe doit faire au moins 6 caractères")
+
+    full_name = f"{technicien.get('prenom', '')} {technicien.get('nom', '')}".strip()
+    user = {
+        "id": str(uuid.uuid4()),
+        "username": data.username,
+        "password": hash_password(data.password),
+        "full_name": full_name,
+        "niveau_acces": "Membre",
+        "branches": technicien.get("branches", []),
+        "technicien_id": technicien["id"],
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "is_active": True,
+        "must_change_password": False
+    }
+    await db.users.insert_one(user)
+    await log_action(user['id'], user['full_name'], "Auto-inscription", f"Compte créé par {full_name}")
+
+    token = create_token(user['id'], user['username'], user['niveau_acces'])
+    return TokenResponse(
+        access_token=token,
+        token_type="bearer",
+        user=UserResponse(
+            id=user['id'], username=user['username'], full_name=user['full_name'],
+            niveau_acces=user['niveau_acces'], branches=user['branches'], technicien_id=user['technicien_id'],
+            created_at=user['created_at'], is_active=user['is_active'], must_change_password=user['must_change_password']
+        )
+    )
 
 # ==================== GROUPS ROUTES ====================
 
@@ -1390,6 +1470,80 @@ async def archive_planning(planning_id: str, current_user: dict = Depends(get_cu
         raise HTTPException(status_code=404, detail="Planning non trouvé")
     await log_action(current_user['id'], current_user['full_name'], "Archivage planning", f"Planning archivé: {planning_id}")
     return {"message": "Planning archivé"}
+
+# ==================== ABSENCES ROUTES ====================
+# Self-service absence declarations. Any authenticated user can declare their
+# own absence (date range + reason); Gestionnaire+ can see everyone's
+# declarations to plan around them (their own view is scoped to their
+# assigned branch(es), same as the Dashboard/Effectif restriction).
+
+def _dates_overlap(a_start: str, a_end: str, b_start: str, b_end: str) -> bool:
+    return a_start <= b_end and b_start <= a_end
+
+@api_router.post("/absences", response_model=AbsenceResponse)
+async def create_absence(data: AbsenceCreate, current_user: dict = Depends(get_current_user)):
+    if data.date_fin < data.date_debut:
+        raise HTTPException(status_code=400, detail="La date de fin doit être après la date de début")
+    absence = {
+        "id": str(uuid.uuid4()),
+        "user_id": current_user["id"],
+        "full_name": current_user["full_name"],
+        "date_debut": data.date_debut,
+        "date_fin": data.date_fin,
+        "raison": data.raison,
+        "created_at": datetime.now(timezone.utc).isoformat()
+    }
+    await db.absences.insert_one(absence)
+    await log_action(current_user['id'], current_user['full_name'], "Déclaration absence", f"{data.date_debut} → {data.date_fin}: {data.raison}")
+    return AbsenceResponse(**{k: v for k, v in absence.items() if k != "_id"})
+
+@api_router.get("/absences/mine", response_model=List[AbsenceResponse])
+async def get_my_absences(current_user: dict = Depends(get_current_user)):
+    absences = await db.absences.find({"user_id": current_user["id"]}, {"_id": 0}).sort("date_debut", 1).to_list(1000)
+    return [AbsenceResponse(**a) for a in absences]
+
+@api_router.get("/absences", response_model=List[AbsenceResponse])
+async def get_absences(mois: Optional[int] = None, annee: Optional[int] = None, current_user: dict = Depends(get_current_user)):
+    check_access(current_user, ["Super Admin", "Admin", "Responsable", "Gestionnaire"])
+    absences = await db.absences.find({}, {"_id": 0}).sort("date_debut", 1).to_list(2000)
+
+    if mois and annee:
+        month_start = f"{annee:04d}-{mois:02d}-01"
+        last_day = 31
+        while True:
+            try:
+                datetime.strptime(f"{annee:04d}-{mois:02d}-{last_day:02d}", "%Y-%m-%d")
+                break
+            except ValueError:
+                last_day -= 1
+        month_end = f"{annee:04d}-{mois:02d}-{last_day:02d}"
+        absences = [a for a in absences if _dates_overlap(a["date_debut"], a["date_fin"], month_start, month_end)]
+
+    # Gestionnaire/Responsable scoped to their own branch(es) only see
+    # absences declared by users sharing one of those branches; Admin/Super
+    # Admin (and Responsables with no branch assigned) see everyone.
+    is_admin = current_user["niveau_acces"] in ["Super Admin", "Admin"]
+    my_branches = current_user.get("branches", [])
+    if not is_admin and my_branches:
+        user_ids = [a["user_id"] for a in absences]
+        users = await db.users.find({"id": {"$in": user_ids}}, {"_id": 0, "id": 1, "branches": 1}).to_list(2000)
+        branches_by_user = {u["id"]: set(u.get("branches", [])) for u in users}
+        absences = [a for a in absences if branches_by_user.get(a["user_id"], set()) & set(my_branches)]
+
+    return [AbsenceResponse(**a) for a in absences]
+
+@api_router.delete("/absences/{absence_id}")
+async def delete_absence(absence_id: str, current_user: dict = Depends(get_current_user)):
+    absence = await db.absences.find_one({"id": absence_id}, {"_id": 0})
+    if not absence:
+        raise HTTPException(status_code=404, detail="Absence non trouvée")
+    is_owner = absence["user_id"] == current_user["id"]
+    is_manager = current_user["niveau_acces"] in ["Super Admin", "Admin", "Responsable", "Gestionnaire"]
+    if not is_owner and not is_manager:
+        raise HTTPException(status_code=403, detail="Accès refusé")
+    await db.absences.delete_one({"id": absence_id})
+    await log_action(current_user['id'], current_user['full_name'], "Suppression absence", absence_id)
+    return {"message": "Absence supprimée"}
 
 # ==================== ACTUALITES ROUTES ====================
 
