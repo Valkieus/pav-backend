@@ -9,10 +9,9 @@ import os
 import logging
 import shutil
 import asyncio
-import socket
-import smtplib
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
+import json
+import urllib.request
+import urllib.error
 from pathlib import Path
 from pydantic import BaseModel, Field
 from typing import List, Optional
@@ -538,62 +537,77 @@ def is_direction_or_admin(user: dict) -> bool:
     return False
 
 # ==================== EMAIL NOTIFICATIONS ====================
-# Free SMTP relay (e.g. a dedicated Gmail account + App Password). Configure via
-# Railway environment variables: SMTP_USER, SMTP_PASSWORD, and optionally
-# SMTP_HOST/SMTP_PORT/EMAIL_FROM_NAME. If unset, emails are silently skipped so
-# the rest of the app keeps working.
+# Sent via the SendGrid HTTPS Email API (v3 /mail/send), not SMTP. Railway
+# blocks all outbound SMTP on Free/Trial/Hobby plans regardless of provider,
+# port, or IP version (see docs.railway.com/networking/outbound-networking) —
+# this was discovered after the original Gmail-SMTP implementation silently
+# failed on every send ("Network is unreachable", then "timed out" once IPv4
+# was forced). SendGrid's API runs over plain HTTPS (port 443), which Railway
+# never blocks, so it works on any Railway plan.
 #
-# Recipient routing: pav.resa (SMTP_USER) is only the *sending* mailbox — a
-# tunnel — not necessarily who reads the notifications. Real recipients are
-# configured per domain so each team only gets what concerns it:
+# Configure via Railway environment variables:
+#   SENDGRID_API_KEY   -> API key from SendGrid (Settings -> API Keys)
+#   SENDGRID_FROM_EMAIL -> the address emails are sent "from". Must be verified
+#                          in SendGrid under Settings -> Sender Authentication ->
+#                          Single Sender Verification (no domain/DNS required —
+#                          just click the confirmation link SendGrid emails to
+#                          that address). Currently pav.reservations@gmail.com.
+#   EMAIL_FROM_NAME     -> display name for the From header (default "PAV Manager")
+# If either SENDGRID_API_KEY or SENDGRID_FROM_EMAIL is unset, emails are
+# silently skipped so the rest of the app keeps working.
+#
+# Note: sending "from" a Gmail address through a third-party API can be flagged
+# or rejected by some receiving providers because of Gmail's own DMARC policy —
+# this is a known deliverability trade-off of avoiding a custom domain, not a
+# bug. Monitor the SendGrid Activity Feed if emails seem to go missing.
+#
+# Recipient routing: pav.resa (SENDGRID_FROM_EMAIL) is only the *sending*
+# identity — a tunnel — not necessarily who reads the notifications. Real
+# recipients are configured per domain so each team only gets what concerns it:
 #   SALLES_NOTIFY_EMAIL         -> Salles/réservations (destinataire réel : Paul)
 #   COORDINATION_NOTIFY_EMAIL   -> Devis + Formations   (destinataires réels : Delphine, Winchel)
 #   ADMIN_NOTIFY_EMAIL          -> RGPD / administration générale (fallback des deux ci-dessus)
 # All three currently point to the same test address (guichardelane1@gmail.com)
 # until the real addresses for Paul/Delphine/Winchel are confirmed and set in
 # Railway — see the two PAV Manager docx documents for the exact variable names.
-SMTP_HOST = os.environ.get('SMTP_HOST', 'smtp.gmail.com')
-SMTP_PORT = int(os.environ.get('SMTP_PORT', '587'))
-SMTP_USER = os.environ.get('SMTP_USER')
-SMTP_PASSWORD = os.environ.get('SMTP_PASSWORD')
+SENDGRID_API_KEY = os.environ.get('SENDGRID_API_KEY')
+SENDGRID_FROM_EMAIL = os.environ.get('SENDGRID_FROM_EMAIL') or os.environ.get('SMTP_USER')
 EMAIL_FROM_NAME = os.environ.get('EMAIL_FROM_NAME', 'PAV Manager')
-ADMIN_NOTIFY_EMAIL = os.environ.get('ADMIN_NOTIFY_EMAIL') or SMTP_USER
+ADMIN_NOTIFY_EMAIL = os.environ.get('ADMIN_NOTIFY_EMAIL') or SENDGRID_FROM_EMAIL
 SALLES_NOTIFY_EMAIL = os.environ.get('SALLES_NOTIFY_EMAIL') or ADMIN_NOTIFY_EMAIL
 COORDINATION_NOTIFY_EMAIL = os.environ.get('COORDINATION_NOTIFY_EMAIL') or ADMIN_NOTIFY_EMAIL
-EMAIL_ENABLED = bool(SMTP_USER and SMTP_PASSWORD)
+EMAIL_ENABLED = bool(SENDGRID_API_KEY and SENDGRID_FROM_EMAIL)
 APP_URL = os.environ.get('APP_URL', 'https://pav-manager-app.netlify.app')
 
-class _IPv4SMTP(smtplib.SMTP):
-    """Plain smtplib.SMTP always tries whatever address family getaddrinfo()
-    returns first. Railway's network has no outbound IPv6 route, and
-    smtp.gmail.com resolves to both A and AAAA records — picking the AAAA
-    record fails immediately with "[Errno 101] Network is unreachable"
-    instead of falling back to IPv4, so every email silently failed. This
-    override only changes how the TCP socket is opened (forcing IPv4); the
-    hostname used for STARTTLS/certificate verification is untouched, so TLS
-    validation still works normally."""
-    def _get_socket(self, host, port, timeout):
-        if timeout is not None and not timeout:
-            raise ValueError('Non-blocking socket (timeout=0) is not supported')
-        addr_info = socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_STREAM)
-        return socket.create_connection(addr_info[0][4], timeout, self.source_address)
-
 def _send_email_sync(to: str, subject: str, body_html: str):
-    msg = MIMEMultipart('alternative')
-    msg['Subject'] = subject
-    msg['From'] = f"{EMAIL_FROM_NAME} <{SMTP_USER}>"
-    msg['To'] = to
-    msg.attach(MIMEText(body_html, 'html'))
-    with _IPv4SMTP(SMTP_HOST, SMTP_PORT, timeout=10) as server:
-        server.starttls()
-        server.login(SMTP_USER, SMTP_PASSWORD)
-        server.sendmail(SMTP_USER, [to], msg.as_string())
+    payload = {
+        "personalizations": [{"to": [{"email": to}]}],
+        "from": {"email": SENDGRID_FROM_EMAIL, "name": EMAIL_FROM_NAME},
+        "subject": subject,
+        "content": [{"type": "text/html", "value": body_html}],
+    }
+    req = urllib.request.Request(
+        "https://api.sendgrid.com/v3/mail/send",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {SENDGRID_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            if resp.status not in (200, 202):
+                raise RuntimeError(f"SendGrid a répondu avec le statut {resp.status}")
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode('utf-8', errors='replace')
+        raise RuntimeError(f"SendGrid HTTP {e.code}: {detail}") from e
 
 async def notify_email(to: Optional[str], subject: str, body_html: str):
     """Best-effort transactional email, sent on a worker thread so the blocking
-    smtplib call never stalls the event loop. Never raises: a misconfigured or
-    down mailbox must not break the underlying workflow action (validation,
-    refusal, etc.) — failures are only logged."""
+    HTTPS call to SendGrid never stalls the event loop. Never raises: a
+    misconfigured API key or down SendGrid must not break the underlying
+    workflow action (validation, refusal, etc.) — failures are only logged."""
     if not EMAIL_ENABLED or not to:
         return
     try:
