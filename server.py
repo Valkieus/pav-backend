@@ -1,4 +1,5 @@
 from fastapi import FastAPI, APIRouter, HTTPException, Depends, status, UploadFile, File
+from fastapi.responses import Response
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.staticfiles import StaticFiles
 from dotenv import load_dotenv
@@ -7,6 +8,10 @@ from motor.motor_asyncio import AsyncIOMotorClient
 import os
 import logging
 import shutil
+import asyncio
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 from pathlib import Path
 from pydantic import BaseModel, Field
 from typing import List, Optional
@@ -134,7 +139,7 @@ class TechnicienCreate(BaseModel):
     niveau_technicien: str
     niveau_acces: str
     branches: List[str]  # Support multiple branches
-    sous_branche: Optional[str] = None
+    sous_branches: Optional[List[str]] = []  # Support multiple sous-branches (Live only)
     badge_attribue: bool = False
     telephone: Optional[str] = None
     email: Optional[str] = None
@@ -146,7 +151,7 @@ class TechnicienResponse(BaseModel):
     niveau_technicien: str
     niveau_acces: str
     branches: List[str]  # Support multiple branches
-    sous_branche: Optional[str] = None
+    sous_branches: Optional[List[str]] = []
     badge_attribue: bool
     telephone: Optional[str] = None
     email: Optional[str] = None
@@ -531,6 +536,64 @@ def is_direction_or_admin(user: dict) -> bool:
         return True
     return False
 
+# ==================== EMAIL NOTIFICATIONS ====================
+# Free SMTP relay (e.g. a dedicated Gmail account + App Password). Configure via
+# Railway environment variables: SMTP_USER, SMTP_PASSWORD, and optionally
+# SMTP_HOST/SMTP_PORT/EMAIL_FROM_NAME/ADMIN_NOTIFY_EMAIL. If unset, emails are
+# silently skipped so the rest of the app keeps working.
+SMTP_HOST = os.environ.get('SMTP_HOST', 'smtp.gmail.com')
+SMTP_PORT = int(os.environ.get('SMTP_PORT', '587'))
+SMTP_USER = os.environ.get('SMTP_USER')
+SMTP_PASSWORD = os.environ.get('SMTP_PASSWORD')
+EMAIL_FROM_NAME = os.environ.get('EMAIL_FROM_NAME', 'PAV Manager')
+ADMIN_NOTIFY_EMAIL = os.environ.get('ADMIN_NOTIFY_EMAIL') or SMTP_USER
+EMAIL_ENABLED = bool(SMTP_USER and SMTP_PASSWORD)
+
+def _send_email_sync(to: str, subject: str, body_html: str):
+    msg = MIMEMultipart('alternative')
+    msg['Subject'] = subject
+    msg['From'] = f"{EMAIL_FROM_NAME} <{SMTP_USER}>"
+    msg['To'] = to
+    msg.attach(MIMEText(body_html, 'html'))
+    with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=10) as server:
+        server.starttls()
+        server.login(SMTP_USER, SMTP_PASSWORD)
+        server.sendmail(SMTP_USER, [to], msg.as_string())
+
+async def notify_email(to: Optional[str], subject: str, body_html: str):
+    """Best-effort transactional email, sent on a worker thread so the blocking
+    smtplib call never stalls the event loop. Never raises: a misconfigured or
+    down mailbox must not break the underlying workflow action (validation,
+    refusal, etc.) — failures are only logged."""
+    if not EMAIL_ENABLED or not to:
+        return
+    try:
+        await asyncio.to_thread(_send_email_sync, to, subject, body_html)
+    except Exception as e:
+        logger.warning(f"Email non envoyé à {to} ({subject}): {e}")
+
+def email_template(title: str, lines: List[str], accent: str = "#B91C1C") -> str:
+    rows = "".join(f"<p style='margin:0 0 10px 0;color:#374151;font-size:14px;line-height:1.5'>{l}</p>" for l in lines)
+    return f"""
+    <div style="font-family:Arial,Helvetica,sans-serif;max-width:520px;margin:0 auto;padding:24px;border:1px solid #e5e7eb;border-radius:8px">
+      <div style="border-bottom:3px solid {accent};padding-bottom:12px;margin-bottom:16px">
+        <span style="font-size:18px;font-weight:bold;color:#1F2937">PAV Manager</span>
+      </div>
+      <h2 style="color:#1F2937;font-size:16px;margin:0 0 14px 0">{title}</h2>
+      {rows}
+      <p style="margin-top:20px;font-size:12px;color:#9CA3AF">Notification automatique — merci de ne pas répondre directement à cet email.</p>
+    </div>
+    """
+
+async def get_user_email(user_id: str) -> Optional[str]:
+    """Login accounts (users) don't carry their own email — resolve it through
+    the technicien profile they're linked to, if any."""
+    user = await db.users.find_one({"id": user_id}, {"_id": 0})
+    if not user or not user.get('technicien_id'):
+        return None
+    tech = await db.techniciens.find_one({"id": user['technicien_id']}, {"_id": 0})
+    return tech.get('email') if tech else None
+
 async def log_action(user_id: str, user_name: str, action: str, details: str):
     log_entry = {
         "id": str(uuid.uuid4()),
@@ -713,7 +776,7 @@ async def seed_data():
                 "niveau_technicien": t["niveau_technicien"],
                 "niveau_acces": t["niveau_acces"],
                 "branches": t["branches"],
-                "sous_branche": t.get("sous_branche"),
+                "sous_branches": ([t["sous_branche"]] if t.get("sous_branche") else []),
                 "badge_attribue": False,
                 "telephone": None,
                 "email": None,
@@ -822,6 +885,52 @@ async def get_me(current_user: dict = Depends(get_current_user)):
         is_active=current_user.get('is_active', True),
         must_change_password=current_user.get('must_change_password', False)
     )
+
+# ==================== RGPD — SELF-SERVICE DATA RIGHTS ====================
+
+@api_router.get("/me/export")
+async def export_my_data(current_user: dict = Depends(get_current_user)):
+    """RGPD droit d'accès / portabilité : renvoie l'intégralité des données
+    personnelles liées au compte de l'utilisateur connecté, dans un format
+    exploitable (JSON)."""
+    technicien = None
+    if current_user.get('technicien_id'):
+        technicien = await db.techniciens.find_one({"id": current_user['technicien_id']}, {"_id": 0})
+    absences = await db.absences.find({"user_id": current_user['id']}, {"_id": 0}).to_list(1000)
+    logs = await db.logs.find({"user_id": current_user['id']}, {"_id": 0}).sort("timestamp", -1).to_list(500)
+    return {
+        "compte": {
+            "id": current_user['id'],
+            "username": current_user['username'],
+            "full_name": current_user['full_name'],
+            "niveau_acces": current_user['niveau_acces'],
+            "branches": current_user.get('branches', []),
+            "created_at": current_user['created_at'],
+        },
+        "profil_technicien": technicien,
+        "absences_declarees": absences,
+        "journal_activite": logs,
+        "genere_le": datetime.now(timezone.utc).isoformat(),
+    }
+
+@api_router.post("/me/delete-request")
+async def request_account_deletion(current_user: dict = Depends(get_current_user)):
+    """RGPD droit à l'effacement : l'utilisateur ne peut pas supprimer lui-même
+    son compte (les comptes sont liés à l'historique Planning/Devis/Formations,
+    dont la conservation répond à un intérêt légitime de gestion du
+    département), mais peut déclencher une demande tracée qu'un Super Admin
+    traitera (anonymisation ou suppression) sous 30 jours."""
+    await db.users.update_one(
+        {"id": current_user['id']},
+        {"$set": {"deletion_requested": True, "deletion_requested_at": datetime.now(timezone.utc).isoformat()}}
+    )
+    await log_action(current_user['id'], current_user['full_name'], "Demande de suppression RGPD", "Demande d'effacement du compte")
+    await notify_email(ADMIN_NOTIFY_EMAIL, "Demande RGPD — suppression de compte", email_template(
+        "Un utilisateur demande la suppression de son compte",
+        [f"<b>Utilisateur :</b> {current_user['full_name']} ({current_user['username']})",
+         "À traiter sous 30 jours conformément au RGPD, depuis Administration → Utilisateurs."]
+    ))
+    return {"message": "Votre demande de suppression a été transmise à l'administration et sera traitée sous 30 jours."}
 
 @api_router.post("/auth/users", response_model=UserResponse)
 async def create_user(data: UserCreate, current_user: dict = Depends(get_current_user)):
@@ -1290,11 +1399,18 @@ async def create_devis(data: DevisCreate, current_user: dict = Depends(get_curre
     }
     await db.devis.insert_one(devis)
     await log_action(current_user['id'], current_user['full_name'], "Création devis", f"Devis créé: {data.titre}")
+    await notify_email(ADMIN_NOTIFY_EMAIL, "Nouveau devis en attente de validation", email_template(
+        "Un nouveau devis attend une validation",
+        [f"<b>Titre :</b> {data.titre}", f"<b>Montant :</b> {data.montant} €", f"<b>Demandé par :</b> {current_user['full_name']}"]
+    ))
     return DevisResponse(**devis)
 
 @api_router.put("/devis/{devis_id}/validate")
 async def validate_devis(devis_id: str, current_user: dict = Depends(get_current_user)):
     check_access(current_user, ["Super Admin", "Admin", "Responsable"])
+    devis = await db.devis.find_one({"id": devis_id}, {"_id": 0})
+    if not devis:
+        raise HTTPException(status_code=404, detail="Devis non trouvé")
     result = await db.devis.update_one(
         {"id": devis_id, "statut": "En attente"},
         {"$set": {"statut": "Validé", "validated_by": current_user['full_name'], "validated_at": datetime.now(timezone.utc).isoformat()}}
@@ -1302,11 +1418,17 @@ async def validate_devis(devis_id: str, current_user: dict = Depends(get_current
     if result.modified_count == 0:
         raise HTTPException(status_code=404, detail="Devis non trouvé ou déjà traité")
     await log_action(current_user['id'], current_user['full_name'], "Validation devis", f"Devis validé: {devis_id}")
+    await notify_email(await get_user_email(devis['created_by']), "Devis validé", email_template(
+        "Votre devis a été validé", [f"<b>Titre :</b> {devis['titre']}", f"<b>Montant :</b> {devis['montant']} €"], accent="#059669"
+    ))
     return {"message": "Devis validé"}
 
 @api_router.put("/devis/{devis_id}/reject")
 async def reject_devis(devis_id: str, current_user: dict = Depends(get_current_user)):
     check_access(current_user, ["Super Admin", "Admin", "Responsable"])
+    devis = await db.devis.find_one({"id": devis_id}, {"_id": 0})
+    if not devis:
+        raise HTTPException(status_code=404, detail="Devis non trouvé")
     result = await db.devis.update_one(
         {"id": devis_id, "statut": "En attente"},
         {"$set": {"statut": "Refusé", "validated_by": current_user['full_name'], "validated_at": datetime.now(timezone.utc).isoformat()}}
@@ -1314,12 +1436,16 @@ async def reject_devis(devis_id: str, current_user: dict = Depends(get_current_u
     if result.modified_count == 0:
         raise HTTPException(status_code=404, detail="Devis non trouvé ou déjà traité")
     await log_action(current_user['id'], current_user['full_name'], "Refus devis", f"Devis refusé: {devis_id}")
+    await notify_email(await get_user_email(devis['created_by']), "Devis refusé", email_template(
+        "Votre devis a été refusé", [f"<b>Titre :</b> {devis['titre']}", f"<b>Montant :</b> {devis['montant']} €"]
+    ))
     return {"message": "Devis refusé"}
 
 @api_router.put("/devis/{devis_id}/revert")
 async def revert_devis(devis_id: str, current_user: dict = Depends(get_current_user)):
     """Send a Validé/Refusé devis back to 'En attente' so it can be re-reviewed."""
     check_access(current_user, ["Super Admin", "Admin", "Responsable"])
+    devis = await db.devis.find_one({"id": devis_id}, {"_id": 0})
     result = await db.devis.update_one(
         {"id": devis_id, "statut": {"$in": ["Validé", "Refusé"]}},
         {"$set": {"statut": "En attente", "validated_by": None, "validated_at": None}}
@@ -1327,6 +1453,10 @@ async def revert_devis(devis_id: str, current_user: dict = Depends(get_current_u
     if result.modified_count == 0:
         raise HTTPException(status_code=404, detail="Devis non trouvé ou déjà en attente")
     await log_action(current_user['id'], current_user['full_name'], "Retour devis en attente", f"Devis remis en attente: {devis_id}")
+    if devis:
+        await notify_email(await get_user_email(devis['created_by']), "Devis remis en attente", email_template(
+            "Votre devis a été remis en attente de validation", [f"<b>Titre :</b> {devis['titre']}"]
+        ))
     return {"message": "Devis remis en attente"}
 
 @api_router.put("/devis/{devis_id}")
@@ -1401,6 +1531,10 @@ async def create_formation(data: FormationCreate, current_user: dict = Depends(g
     }
     await db.formations.insert_one(formation)
     await log_action(current_user['id'], current_user['full_name'], "Demande formation", f"Formation demandée: {data.titre}")
+    await notify_email(ADMIN_NOTIFY_EMAIL, "Nouvelle demande de formation", email_template(
+        "Une nouvelle demande de formation attend la Coordination",
+        [f"<b>Titre :</b> {data.titre}", f"<b>Demandé par :</b> {current_user['full_name']}", f"<b>Date souhaitée :</b> {data.date_souhaitee}"]
+    ))
     return FormationResponse(**formation)
 
 @api_router.put("/formations/{formation_id}", response_model=FormationResponse)
@@ -1446,6 +1580,13 @@ async def coordination_validate_formation(formation_id: str, data: FormationCoor
         raise HTTPException(status_code=404, detail="Formation non trouvée ou déjà traitée")
     await log_action(current_user['id'], current_user['full_name'], "Validation Coordination", f"Formation transmise pour validation finale: {formation_id}")
     formation = await db.formations.find_one({"id": formation_id}, {"_id": 0})
+    await notify_email(await get_user_email(formation['created_by']), "Votre demande de formation avance", email_template(
+        "Votre demande de formation est transmise pour validation finale",
+        [f"<b>Titre :</b> {formation['titre']}", f"<b>Formateur :</b> {formation.get('formateur') or '-'}", f"<b>Lieu :</b> {formation.get('lieu') or '-'}"]
+    ))
+    await notify_email(ADMIN_NOTIFY_EMAIL, "Formation en attente de validation finale", email_template(
+        "Une formation attend la validation finale de la Direction", [f"<b>Titre :</b> {formation['titre']}"]
+    ))
     return FormationResponse(**formation)
 
 @api_router.put("/formations/{formation_id}/coordination-reject", response_model=FormationResponse)
@@ -1466,6 +1607,9 @@ async def coordination_reject_formation(formation_id: str, data: FormationReject
         raise HTTPException(status_code=404, detail="Formation non trouvée ou déjà traitée")
     await log_action(current_user['id'], current_user['full_name'], "Refus formation (Coordination)", f"Formation refusée: {formation_id}")
     formation = await db.formations.find_one({"id": formation_id}, {"_id": 0})
+    await notify_email(await get_user_email(formation['created_by']), "Demande de formation refusée", email_template(
+        "Votre demande de formation a été refusée", [f"<b>Titre :</b> {formation['titre']}", f"<b>Motif :</b> {data.motif or '-'}"]
+    ))
     return FormationResponse(**formation)
 
 @api_router.put("/formations/{formation_id}/final-validate", response_model=FormationResponse)
@@ -1485,6 +1629,9 @@ async def final_validate_formation(formation_id: str, current_user: dict = Depen
         raise HTTPException(status_code=404, detail="Formation non trouvée ou déjà traitée")
     await log_action(current_user['id'], current_user['full_name'], "Validation finale formation", f"Formation validée: {formation_id}")
     formation = await db.formations.find_one({"id": formation_id}, {"_id": 0})
+    await notify_email(await get_user_email(formation['created_by']), "Formation validée", email_template(
+        "Votre demande de formation a été validée", [f"<b>Titre :</b> {formation['titre']}", f"<b>Date souhaitée :</b> {formation.get('date_souhaitee') or '-'}"], accent="#059669"
+    ))
     return FormationResponse(**formation)
 
 @api_router.put("/formations/{formation_id}/final-reject", response_model=FormationResponse)
@@ -1505,6 +1652,9 @@ async def final_reject_formation(formation_id: str, data: FormationRejectReason,
         raise HTTPException(status_code=404, detail="Formation non trouvée ou déjà traitée")
     await log_action(current_user['id'], current_user['full_name'], "Refus formation (Direction)", f"Formation refusée: {formation_id}")
     formation = await db.formations.find_one({"id": formation_id}, {"_id": 0})
+    await notify_email(await get_user_email(formation['created_by']), "Demande de formation refusée", email_template(
+        "Votre demande de formation a été refusée en validation finale", [f"<b>Titre :</b> {formation['titre']}", f"<b>Motif :</b> {data.motif or '-'}"]
+    ))
     return FormationResponse(**formation)
 
 @api_router.put("/formations/{formation_id}/archive")
@@ -2144,7 +2294,19 @@ async def create_public_reservation(token: str, data: ReservationCreate):
         "share_link_id": link['id']
     }
     await db.reservations.insert_one(reservation)
-    
+
+    await notify_email(data.email, "Demande de réservation reçue", email_template(
+        "Votre demande de réservation a bien été reçue",
+        [f"<b>Salle :</b> {salle['nom']}", f"<b>Date :</b> {data.date}",
+         f"<b>Créneau :</b> {creneau['nom']} ({creneau['heure_debut']}-{creneau['heure_fin']})",
+         "Elle est en attente de validation — vous recevrez un email dès qu'elle sera traitée."]
+    ))
+    await notify_email(ADMIN_NOTIFY_EMAIL, "Nouvelle demande de réservation à valider", email_template(
+        "Une nouvelle demande de réservation attend une validation",
+        [f"<b>Demandeur :</b> {data.nom_demandeur}", f"<b>Salle :</b> {salle['nom']}", f"<b>Date :</b> {data.date}",
+         f"<b>Créneau :</b> {creneau['nom']}", f"<b>Raison :</b> {data.raison}"]
+    ))
+
     return ReservationResponse(**reservation)
 
 # ==================== RESERVATIONS ROUTES (ADMIN) ====================
@@ -2187,11 +2349,20 @@ async def validate_reservation(reservation_id: str, current_user: dict = Depends
     if result.modified_count == 0:
         raise HTTPException(status_code=404, detail="Réservation non trouvée ou déjà traitée")
     await log_action(current_user['id'], current_user['full_name'], "Validation réservation", f"Réservation validée: {reservation_id}")
+    await notify_email(reservation.get('email'), "Réservation validée", email_template(
+        "Votre réservation a été validée",
+        [f"<b>Salle :</b> {reservation['salle_nom']}", f"<b>Date :</b> {reservation['date']}",
+         f"<b>Créneau :</b> {reservation['creneau_nom']} ({reservation['heure_debut']}-{reservation['heure_fin']})"],
+        accent="#059669"
+    ))
     return {"message": "Réservation validée"}
 
 @api_router.put("/reservations/{reservation_id}/reject")
 async def reject_reservation(reservation_id: str, data: RejectReservationRequest, current_user: dict = Depends(get_current_user)):
     check_access(current_user, ["Super Admin", "Admin", "Responsable"])
+    reservation = await db.reservations.find_one({"id": reservation_id}, {"_id": 0})
+    if not reservation:
+        raise HTTPException(status_code=404, detail="Réservation non trouvée")
     result = await db.reservations.update_one(
         {"id": reservation_id, "statut": "En attente"},
         {"$set": {
@@ -2204,6 +2375,11 @@ async def reject_reservation(reservation_id: str, data: RejectReservationRequest
     if result.modified_count == 0:
         raise HTTPException(status_code=404, detail="Réservation non trouvée ou déjà traitée")
     await log_action(current_user['id'], current_user['full_name'], "Refus réservation", f"Réservation refusée: {reservation_id} - Raison: {data.raison_refus}")
+    await notify_email(reservation.get('email'), "Réservation refusée", email_template(
+        "Votre réservation n'a pas été retenue",
+        [f"<b>Salle :</b> {reservation['salle_nom']}", f"<b>Date :</b> {reservation['date']}",
+         f"<b>Raison du refus :</b> {data.raison_refus}"]
+    ))
     return {"message": "Réservation refusée"}
 
 @api_router.post("/reservations/admin", response_model=ReservationResponse)
@@ -2255,6 +2431,12 @@ async def create_admin_reservation(data: AdminReservationCreate, current_user: d
     
     await db.reservations.insert_one(reservation)
     await log_action(current_user['id'], current_user['full_name'], "Création réunion admin", f"Réunion créée: {data.raison} - {salle['nom']} - {data.date}")
+    if data.email:
+        title = "Réunion confirmée" if data.statut == "Validée" else "Demande de réservation reçue"
+        await notify_email(data.email, title, email_template(
+            title, [f"<b>Salle :</b> {salle['nom']}", f"<b>Date :</b> {data.date}", f"<b>Créneau :</b> {creneau['nom']} ({creneau['heure_debut']}-{creneau['heure_fin']})"],
+            accent="#059669" if data.statut == "Validée" else "#B91C1C"
+        ))
     return ReservationResponse(**reservation)
 
 @api_router.delete("/reservations/{reservation_id}")
@@ -2345,42 +2527,66 @@ ALLOWED_EXTENSIONS = {'pdf', 'png', 'jpg', 'jpeg', 'gif', 'webp', 'doc', 'docx',
 def allowed_file(filename: str) -> bool:
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
+CONTENT_TYPES = {
+    'png': 'image/png', 'jpg': 'image/jpeg', 'jpeg': 'image/jpeg', 'gif': 'image/gif', 'webp': 'image/webp',
+    'pdf': 'application/pdf',
+    'doc': 'application/msword', 'docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    'xls': 'application/vnd.ms-excel', 'xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    'ppt': 'application/vnd.ms-powerpoint', 'pptx': 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+}
+
 @api_router.post("/upload")
 async def upload_file(file: UploadFile = File(...), current_user: dict = Depends(get_current_user)):
-    """Upload a file to the server (max 10MB)"""
+    """Upload a file (max 10MB). Stored directly in MongoDB (not on local disk):
+    Railway's container filesystem is ephemeral and is wiped on every redeploy/
+    restart, which used to silently delete previously uploaded images (e.g.
+    Actualités photos). MongoDB is the persistent store, so this survives
+    redeploys."""
     check_access(current_user, ["Super Admin", "Admin", "Responsable"])
-    
+
     if not file.filename:
         raise HTTPException(status_code=400, detail="Aucun fichier fourni")
-    
+
     if not allowed_file(file.filename):
         raise HTTPException(status_code=400, detail=f"Type de fichier non autorisé. Types acceptés: {', '.join(ALLOWED_EXTENSIONS)}")
-    
+
     # Check file size
     contents = await file.read()
     if len(contents) > MAX_FILE_SIZE:
         raise HTTPException(status_code=400, detail="Fichier trop volumineux (max 10 MB)")
-    
-    # Generate unique filename
+
     ext = file.filename.rsplit('.', 1)[1].lower()
     unique_filename = f"{uuid.uuid4()}.{ext}"
-    file_path = UPLOAD_DIR / unique_filename
-    
-    # Save file
-    with open(file_path, "wb") as f:
-        f.write(contents)
-    
-    # Return URL path (will be served by static files)
+
+    await db.files.insert_one({
+        "id": unique_filename,
+        "filename": file.filename,
+        "content_type": CONTENT_TYPES.get(ext, "application/octet-stream"),
+        "data": contents,
+        "size": len(contents),
+        "uploaded_by": current_user['id'],
+        "created_at": datetime.now(timezone.utc).isoformat()
+    })
+
     file_url = f"/api/uploads/{unique_filename}"
-    
+
     await log_action(current_user['id'], current_user['full_name'], "Upload fichier", f"Fichier uploadé: {file.filename}")
-    
+
     return {
         "url": file_url,
         "filename": file.filename,
         "size": len(contents),
         "type": ext
     }
+
+@api_router.get("/uploads/{file_id}")
+async def get_uploaded_file(file_id: str):
+    """Serve a file previously stored via /upload. Public (like the old static
+    mount) since these URLs are embedded directly in pages (e.g. Actualités)."""
+    doc = await db.files.find_one({"id": file_id}, {"_id": 0})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Fichier non trouvé")
+    return Response(content=bytes(doc["data"]), media_type=doc.get("content_type", "application/octet-stream"))
 
 # ==================== MAINTENANCE MODE ROUTES ====================
 
@@ -2440,6 +2646,29 @@ async def startup():
         logger.info("MongoDB indexes created")
     except Exception as e:
         logger.warning(f"Index creation skipped: {e}")
+
+    # One-off migration: sous_branche (single string) -> sous_branches (list),
+    # so existing technicien records keep their sous-branche after the switch
+    # to multi-select. Safe to run on every boot (no-op once migrated).
+    try:
+        async for t in db.techniciens.find({"sous_branche": {"$exists": True}}, {"_id": 0, "id": 1, "sous_branche": 1}):
+            val = t.get("sous_branche")
+            await db.techniciens.update_one(
+                {"id": t["id"]},
+                {"$set": {"sous_branches": [val] if val else []}, "$unset": {"sous_branche": ""}}
+            )
+    except Exception as e:
+        logger.warning(f"sous_branche migration skipped: {e}")
+
+    # RGPD: purge activity logs older than 12 months (data retention policy)
+    try:
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=365)).isoformat()
+        result = await db.logs.delete_many({"timestamp": {"$lt": cutoff}})
+        if result.deleted_count:
+            logger.info(f"RGPD: {result.deleted_count} logs de plus de 12 mois purgés")
+    except Exception as e:
+        logger.warning(f"Log retention purge skipped: {e}")
+
     logger.info("PAV Management System started")
 
 @app.on_event("shutdown")
@@ -2447,9 +2676,6 @@ async def shutdown_db_client():
     client.close()
 
 app.include_router(api_router)
-
-# Mount uploads directory for serving files
-app.mount("/api/uploads", StaticFiles(directory=str(UPLOAD_DIR)), name="uploads")
 
 app.add_middleware(
     CORSMiddleware,
