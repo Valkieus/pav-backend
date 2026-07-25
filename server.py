@@ -9,6 +9,7 @@ import os
 import logging
 import shutil
 import asyncio
+import socket
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -562,13 +563,28 @@ COORDINATION_NOTIFY_EMAIL = os.environ.get('COORDINATION_NOTIFY_EMAIL') or ADMIN
 EMAIL_ENABLED = bool(SMTP_USER and SMTP_PASSWORD)
 APP_URL = os.environ.get('APP_URL', 'https://pav-manager-app.netlify.app')
 
+class _IPv4SMTP(smtplib.SMTP):
+    """Plain smtplib.SMTP always tries whatever address family getaddrinfo()
+    returns first. Railway's network has no outbound IPv6 route, and
+    smtp.gmail.com resolves to both A and AAAA records — picking the AAAA
+    record fails immediately with "[Errno 101] Network is unreachable"
+    instead of falling back to IPv4, so every email silently failed. This
+    override only changes how the TCP socket is opened (forcing IPv4); the
+    hostname used for STARTTLS/certificate verification is untouched, so TLS
+    validation still works normally."""
+    def _get_socket(self, host, port, timeout):
+        if timeout is not None and not timeout:
+            raise ValueError('Non-blocking socket (timeout=0) is not supported')
+        addr_info = socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_STREAM)
+        return socket.create_connection(addr_info[0][4], timeout, self.source_address)
+
 def _send_email_sync(to: str, subject: str, body_html: str):
     msg = MIMEMultipart('alternative')
     msg['Subject'] = subject
     msg['From'] = f"{EMAIL_FROM_NAME} <{SMTP_USER}>"
     msg['To'] = to
     msg.attach(MIMEText(body_html, 'html'))
-    with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=10) as server:
+    with _IPv4SMTP(SMTP_HOST, SMTP_PORT, timeout=10) as server:
         server.starttls()
         server.login(SMTP_USER, SMTP_PASSWORD)
         server.sendmail(SMTP_USER, [to], msg.as_string())
@@ -584,6 +600,21 @@ async def notify_email(to: Optional[str], subject: str, body_html: str):
         await asyncio.to_thread(_send_email_sync, to, subject, body_html)
     except Exception as e:
         logger.warning(f"Email non envoyé à {to} ({subject}): {e}")
+
+# Fire-and-forget scheduling: awaiting notify_email() directly inside a request
+# handler makes the HTTP response wait for the full SMTP round-trip (connect +
+# STARTTLS + login + send to Gmail), which can take several seconds and made
+# actions like "Valider"/"Refuser" feel slow. fire_and_forget_email() schedules
+# the same notify_email() coroutine as a background asyncio Task instead, so the
+# request returns immediately and the email is sent slightly after. A module-level
+# set keeps a reference to each Task until it finishes (asyncio would otherwise be
+# free to garbage-collect a Task with no other referent before it completes).
+_background_email_tasks: set = set()
+
+def fire_and_forget_email(to: Optional[str], subject: str, body_html: str):
+    task = asyncio.create_task(notify_email(to, subject, body_html))
+    _background_email_tasks.add(task)
+    task.add_done_callback(_background_email_tasks.discard)
 
 # Visual "kind" of a notification: controls the accent color and the small
 # status badge shown under the title, so recipients can tell at a glance
@@ -955,7 +986,7 @@ async def request_account_deletion(current_user: dict = Depends(get_current_user
         {"$set": {"deletion_requested": True, "deletion_requested_at": datetime.now(timezone.utc).isoformat()}}
     )
     await log_action(current_user['id'], current_user['full_name'], "Demande de suppression RGPD", "Demande d'effacement du compte")
-    await notify_email(ADMIN_NOTIFY_EMAIL, "Demande RGPD — suppression de compte", email_template(
+    fire_and_forget_email(ADMIN_NOTIFY_EMAIL, "Demande RGPD — suppression de compte", email_template(
         "Un utilisateur demande la suppression de son compte",
         [f"<b>Utilisateur :</b> {current_user['full_name']} ({current_user['username']})",
          "À traiter sous 30 jours conformément au RGPD, depuis Administration → Utilisateurs."],
@@ -1430,7 +1461,7 @@ async def create_devis(data: DevisCreate, current_user: dict = Depends(get_curre
     }
     await db.devis.insert_one(devis)
     await log_action(current_user['id'], current_user['full_name'], "Création devis", f"Devis créé: {data.titre}")
-    await notify_email(COORDINATION_NOTIFY_EMAIL, "Nouveau devis en attente de validation", email_template(
+    fire_and_forget_email(COORDINATION_NOTIFY_EMAIL, "Nouveau devis en attente de validation", email_template(
         "Un nouveau devis attend une validation",
         ["Bonjour,", f"<b>Titre :</b> {data.titre}", f"<b>Montant :</b> {data.montant} €", f"<b>Demandé par :</b> {current_user['full_name']}"],
         kind="pending"
@@ -1450,7 +1481,7 @@ async def validate_devis(devis_id: str, current_user: dict = Depends(get_current
     if result.modified_count == 0:
         raise HTTPException(status_code=404, detail="Devis non trouvé ou déjà traité")
     await log_action(current_user['id'], current_user['full_name'], "Validation devis", f"Devis validé: {devis_id}")
-    await notify_email(await get_user_email(devis['created_by']), "Devis validé", email_template(
+    fire_and_forget_email(await get_user_email(devis['created_by']), "Devis validé", email_template(
         "Votre devis a été validé",
         [f"Bonjour {devis.get('created_by_name', '')},", f"<b>Titre :</b> {devis['titre']}", f"<b>Montant :</b> {devis['montant']} €"],
         kind="success"
@@ -1470,7 +1501,7 @@ async def reject_devis(devis_id: str, current_user: dict = Depends(get_current_u
     if result.modified_count == 0:
         raise HTTPException(status_code=404, detail="Devis non trouvé ou déjà traité")
     await log_action(current_user['id'], current_user['full_name'], "Refus devis", f"Devis refusé: {devis_id}")
-    await notify_email(await get_user_email(devis['created_by']), "Devis refusé", email_template(
+    fire_and_forget_email(await get_user_email(devis['created_by']), "Devis refusé", email_template(
         "Votre devis a été refusé",
         [f"Bonjour {devis.get('created_by_name', '')},", f"<b>Titre :</b> {devis['titre']}", f"<b>Montant :</b> {devis['montant']} €"],
         kind="danger"
@@ -1490,7 +1521,7 @@ async def revert_devis(devis_id: str, current_user: dict = Depends(get_current_u
         raise HTTPException(status_code=404, detail="Devis non trouvé ou déjà en attente")
     await log_action(current_user['id'], current_user['full_name'], "Retour devis en attente", f"Devis remis en attente: {devis_id}")
     if devis:
-        await notify_email(await get_user_email(devis['created_by']), "Devis remis en attente", email_template(
+        fire_and_forget_email(await get_user_email(devis['created_by']), "Devis remis en attente", email_template(
             "Votre devis a été remis en attente de validation",
             [f"Bonjour {devis.get('created_by_name', '')},", f"<b>Titre :</b> {devis['titre']}"],
             kind="pending"
@@ -1569,7 +1600,7 @@ async def create_formation(data: FormationCreate, current_user: dict = Depends(g
     }
     await db.formations.insert_one(formation)
     await log_action(current_user['id'], current_user['full_name'], "Demande formation", f"Formation demandée: {data.titre}")
-    await notify_email(COORDINATION_NOTIFY_EMAIL, "Nouvelle demande de formation", email_template(
+    fire_and_forget_email(COORDINATION_NOTIFY_EMAIL, "Nouvelle demande de formation", email_template(
         "Une nouvelle demande de formation attend la Coordination",
         ["Bonjour,", f"<b>Titre :</b> {data.titre}", f"<b>Demandé par :</b> {current_user['full_name']}", f"<b>Date souhaitée :</b> {data.date_souhaitee}"],
         kind="pending"
@@ -1619,13 +1650,13 @@ async def coordination_validate_formation(formation_id: str, data: FormationCoor
         raise HTTPException(status_code=404, detail="Formation non trouvée ou déjà traitée")
     await log_action(current_user['id'], current_user['full_name'], "Validation Coordination", f"Formation transmise pour validation finale: {formation_id}")
     formation = await db.formations.find_one({"id": formation_id}, {"_id": 0})
-    await notify_email(await get_user_email(formation['created_by']), "Votre demande de formation avance", email_template(
+    fire_and_forget_email(await get_user_email(formation['created_by']), "Votre demande de formation avance", email_template(
         "Votre demande de formation est transmise pour validation finale",
         [f"Bonjour {formation.get('created_by_name', '')},", f"<b>Titre :</b> {formation['titre']}",
          f"<b>Formateur :</b> {formation.get('formateur') or '-'}", f"<b>Lieu :</b> {formation.get('lieu') or '-'}"],
         kind="pending"
     ))
-    await notify_email(COORDINATION_NOTIFY_EMAIL, "Formation en attente de validation finale", email_template(
+    fire_and_forget_email(COORDINATION_NOTIFY_EMAIL, "Formation en attente de validation finale", email_template(
         "Une formation attend la validation finale de la Direction",
         ["Bonjour,", f"<b>Titre :</b> {formation['titre']}"],
         kind="pending"
@@ -1650,7 +1681,7 @@ async def coordination_reject_formation(formation_id: str, data: FormationReject
         raise HTTPException(status_code=404, detail="Formation non trouvée ou déjà traitée")
     await log_action(current_user['id'], current_user['full_name'], "Refus formation (Coordination)", f"Formation refusée: {formation_id}")
     formation = await db.formations.find_one({"id": formation_id}, {"_id": 0})
-    await notify_email(await get_user_email(formation['created_by']), "Demande de formation refusée", email_template(
+    fire_and_forget_email(await get_user_email(formation['created_by']), "Demande de formation refusée", email_template(
         "Votre demande de formation a été refusée",
         [f"Bonjour {formation.get('created_by_name', '')},", f"<b>Titre :</b> {formation['titre']}", f"<b>Motif :</b> {data.motif or '-'}"],
         kind="danger"
@@ -1674,7 +1705,7 @@ async def final_validate_formation(formation_id: str, current_user: dict = Depen
         raise HTTPException(status_code=404, detail="Formation non trouvée ou déjà traitée")
     await log_action(current_user['id'], current_user['full_name'], "Validation finale formation", f"Formation validée: {formation_id}")
     formation = await db.formations.find_one({"id": formation_id}, {"_id": 0})
-    await notify_email(await get_user_email(formation['created_by']), "Formation validée", email_template(
+    fire_and_forget_email(await get_user_email(formation['created_by']), "Formation validée", email_template(
         "Votre demande de formation a été validée",
         [f"Bonjour {formation.get('created_by_name', '')},", f"<b>Titre :</b> {formation['titre']}", f"<b>Date souhaitée :</b> {formation.get('date_souhaitee') or '-'}"],
         kind="success"
@@ -1699,7 +1730,7 @@ async def final_reject_formation(formation_id: str, data: FormationRejectReason,
         raise HTTPException(status_code=404, detail="Formation non trouvée ou déjà traitée")
     await log_action(current_user['id'], current_user['full_name'], "Refus formation (Direction)", f"Formation refusée: {formation_id}")
     formation = await db.formations.find_one({"id": formation_id}, {"_id": 0})
-    await notify_email(await get_user_email(formation['created_by']), "Demande de formation refusée", email_template(
+    fire_and_forget_email(await get_user_email(formation['created_by']), "Demande de formation refusée", email_template(
         "Votre demande de formation a été refusée en validation finale",
         [f"Bonjour {formation.get('created_by_name', '')},", f"<b>Titre :</b> {formation['titre']}", f"<b>Motif :</b> {data.motif or '-'}"],
         kind="danger"
@@ -2344,14 +2375,14 @@ async def create_public_reservation(token: str, data: ReservationCreate):
     }
     await db.reservations.insert_one(reservation)
 
-    await notify_email(data.email, "Demande de réservation reçue", email_template(
+    fire_and_forget_email(data.email, "Demande de réservation reçue", email_template(
         "Votre demande de réservation a bien été reçue",
         [f"Bonjour {data.nom_demandeur},", f"<b>Salle :</b> {salle['nom']}", f"<b>Date :</b> {data.date}",
          f"<b>Créneau :</b> {creneau['nom']} ({creneau['heure_debut']}-{creneau['heure_fin']})",
          "Elle est en attente de validation — vous recevrez un email dès qu'elle sera traitée."],
         kind="pending"
     ))
-    await notify_email(SALLES_NOTIFY_EMAIL, "Nouvelle demande de réservation à valider", email_template(
+    fire_and_forget_email(SALLES_NOTIFY_EMAIL, "Nouvelle demande de réservation à valider", email_template(
         "Une nouvelle demande de réservation attend une validation",
         ["Bonjour,", f"<b>Demandeur :</b> {data.nom_demandeur}", f"<b>Salle :</b> {salle['nom']}", f"<b>Date :</b> {data.date}",
          f"<b>Créneau :</b> {creneau['nom']}", f"<b>Raison :</b> {data.raison}"],
@@ -2400,7 +2431,7 @@ async def validate_reservation(reservation_id: str, current_user: dict = Depends
     if result.modified_count == 0:
         raise HTTPException(status_code=404, detail="Réservation non trouvée ou déjà traitée")
     await log_action(current_user['id'], current_user['full_name'], "Validation réservation", f"Réservation validée: {reservation_id}")
-    await notify_email(reservation.get('email'), "Réservation validée", email_template(
+    fire_and_forget_email(reservation.get('email'), "Réservation validée", email_template(
         "Votre réservation a été validée",
         [f"Bonjour {reservation.get('nom_demandeur', '')},", f"<b>Salle :</b> {reservation['salle_nom']}", f"<b>Date :</b> {reservation['date']}",
          f"<b>Créneau :</b> {reservation['creneau_nom']} ({reservation['heure_debut']}-{reservation['heure_fin']})"],
@@ -2426,7 +2457,7 @@ async def reject_reservation(reservation_id: str, data: RejectReservationRequest
     if result.modified_count == 0:
         raise HTTPException(status_code=404, detail="Réservation non trouvée ou déjà traitée")
     await log_action(current_user['id'], current_user['full_name'], "Refus réservation", f"Réservation refusée: {reservation_id} - Raison: {data.raison_refus}")
-    await notify_email(reservation.get('email'), "Réservation refusée", email_template(
+    fire_and_forget_email(reservation.get('email'), "Réservation refusée", email_template(
         "Votre réservation n'a pas été retenue",
         [f"Bonjour {reservation.get('nom_demandeur', '')},", f"<b>Salle :</b> {reservation['salle_nom']}", f"<b>Date :</b> {reservation['date']}",
          f"<b>Raison du refus :</b> {data.raison_refus}"],
@@ -2485,7 +2516,7 @@ async def create_admin_reservation(data: AdminReservationCreate, current_user: d
     await log_action(current_user['id'], current_user['full_name'], "Création réunion admin", f"Réunion créée: {data.raison} - {salle['nom']} - {data.date}")
     if data.email:
         title = "Réunion confirmée" if data.statut == "Validée" else "Demande de réservation reçue"
-        await notify_email(data.email, title, email_template(
+        fire_and_forget_email(data.email, title, email_template(
             title,
             [f"Bonjour {data.nom_demandeur},", f"<b>Salle :</b> {salle['nom']}", f"<b>Date :</b> {data.date}", f"<b>Créneau :</b> {creneau['nom']} ({creneau['heure_debut']}-{creneau['heure_fin']})"],
             kind="success" if data.statut == "Validée" else "pending"
