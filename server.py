@@ -273,6 +273,8 @@ class PlanningCreate(BaseModel):
     dates: dict  # Changed to dict: {dimanche: [], vendredi: []}
     affectations: dict
     sections: Optional[dict] = None
+    notes: Optional[dict] = None
+    absences: Optional[dict] = None
 
 class PlanningResponse(BaseModel):
     id: str
@@ -281,6 +283,8 @@ class PlanningResponse(BaseModel):
     dates: dict
     affectations: dict
     sections: Optional[dict] = None
+    notes: Optional[dict] = None
+    absences: Optional[dict] = None
     is_archived: bool
     created_at: str
     updated_at: str
@@ -1337,6 +1341,8 @@ async def create_planning(data: PlanningCreate, current_user: dict = Depends(get
         "dates": data.dates,
         "affectations": data.affectations,
         "sections": data.sections,
+        "notes": data.notes,
+        "absences": data.absences,
         "is_archived": False,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "updated_at": datetime.now(timezone.utc).isoformat()
@@ -1352,6 +1358,8 @@ async def update_planning(planning_id: str, data: PlanningCreate, current_user: 
         "dates": data.dates,
         "affectations": data.affectations,
         "sections": data.sections,
+        "notes": data.notes,
+        "absences": data.absences,
         "updated_at": datetime.now(timezone.utc).isoformat()
     }
     result = await db.planning.update_one({"id": planning_id}, {"$set": update_data})
