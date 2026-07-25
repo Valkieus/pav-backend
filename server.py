@@ -10,10 +10,11 @@ import logging
 import shutil
 import asyncio
 import json
+import re
 import urllib.request
 import urllib.error
 from pathlib import Path
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from typing import List, Optional
 import uuid
 from datetime import datetime, timezone, timedelta
@@ -413,6 +414,23 @@ class ReservationCreate(BaseModel):
     email: str
     raison: str
 
+    @field_validator('email')
+    @classmethod
+    def validate_email_format(cls, v):
+        v = (v or '').strip()
+        if not re.match(r'^[^@\s]+@[^@\s]+\.[^@\s]+$', v):
+            raise ValueError("Adresse email invalide")
+        return v
+
+    @field_validator('telephone')
+    @classmethod
+    def validate_telephone_format(cls, v):
+        v = (v or '').strip()
+        digits = re.sub(r'[^0-9]', '', v)
+        if len(digits) < 8 or len(digits) > 15 or not re.match(r'^[0-9+\s().-]+$', v):
+            raise ValueError("Numéro de téléphone invalide")
+        return v
+
 class ReservationResponse(BaseModel):
     id: str
     salle_id: str
@@ -580,11 +598,21 @@ EMAIL_ENABLED = bool(SENDGRID_API_KEY and SENDGRID_FROM_EMAIL)
 APP_URL = os.environ.get('APP_URL', 'https://pav-manager-app.netlify.app')
 
 def _send_email_sync(to: str, subject: str, body_html: str):
+    # A plain-text alternative alongside the HTML body. Multipart messages
+    # (text/plain + text/html) are generally trusted more by spam filters
+    # than HTML-only ones — one of the few levers left to help deliverability
+    # without a custom verified sending domain (see comment above).
+    text_body = re.sub(r'<br\s*/?>', '\n', body_html)
+    text_body = re.sub(r'<[^>]+>', '', text_body)
+    text_body = re.sub(r'\n{3,}', '\n\n', text_body).strip()
     payload = {
         "personalizations": [{"to": [{"email": to}]}],
         "from": {"email": SENDGRID_FROM_EMAIL, "name": EMAIL_FROM_NAME},
         "subject": subject,
-        "content": [{"type": "text/html", "value": body_html}],
+        "content": [
+            {"type": "text/plain", "value": text_body},
+            {"type": "text/html", "value": body_html},
+        ],
     }
     req = urllib.request.Request(
         "https://api.sendgrid.com/v3/mail/send",
@@ -668,6 +696,121 @@ async def get_user_email(user_id: str) -> Optional[str]:
         return None
     tech = await db.techniciens.find_one({"id": user['technicien_id']}, {"_id": 0})
     return tech.get('email') if tech else None
+
+# ==================== EDITABLE SALLES EMAIL TEMPLATES ====================
+# The wording of the 4 reservation-related emails can be customized from
+# Salles > Notifications in the app (no code change/redeploy needed).
+# Customizations live in the `email_templates` collection, keyed by these
+# `key`s; anything not customized falls back to the defaults below. Body
+# lines support simple {placeholder} substitution — see each entry's
+# "placeholders" list for what's available in that context.
+DEFAULT_EMAIL_TEMPLATES = {
+    "reservation_recue": {
+        "label": "Confirmation de réception (au demandeur)",
+        "subject": "Demande de réservation reçue",
+        "body_lines": [
+            "Bonjour {nom_demandeur},",
+            "<b>Salle :</b> {salle_nom}",
+            "<b>Date :</b> {date}",
+            "<b>Créneau :</b> {creneau_nom} ({heure_debut}-{heure_fin})",
+            "Elle est en attente de validation — vous recevrez un email dès qu'elle sera traitée.",
+        ],
+        "kind": "pending",
+        "placeholders": ["nom_demandeur", "salle_nom", "date", "creneau_nom", "heure_debut", "heure_fin", "raison"],
+    },
+    "reservation_a_valider": {
+        "label": "Nouvelle demande à valider (destinataires internes)",
+        "subject": "Nouvelle demande de réservation à valider",
+        "body_lines": [
+            "Bonjour,",
+            "<b>Demandeur :</b> {nom_demandeur}",
+            "<b>Salle :</b> {salle_nom}",
+            "<b>Date :</b> {date}",
+            "<b>Créneau :</b> {creneau_nom}",
+            "<b>Raison :</b> {raison}",
+        ],
+        "kind": "pending",
+        "placeholders": ["nom_demandeur", "salle_nom", "date", "creneau_nom", "heure_debut", "heure_fin", "raison"],
+    },
+    "reservation_validee": {
+        "label": "Réservation validée (au demandeur + copie interne)",
+        "subject": "Réservation validée",
+        "body_lines": [
+            "Bonjour {nom_demandeur},",
+            "<b>Salle :</b> {salle_nom}",
+            "<b>Date :</b> {date}",
+            "<b>Créneau :</b> {creneau_nom} ({heure_debut}-{heure_fin})",
+        ],
+        "kind": "success",
+        "placeholders": ["nom_demandeur", "salle_nom", "date", "creneau_nom", "heure_debut", "heure_fin"],
+    },
+    "reservation_refusee": {
+        "label": "Réservation refusée (au demandeur)",
+        "subject": "Réservation refusée",
+        "body_lines": [
+            "Bonjour {nom_demandeur},",
+            "<b>Salle :</b> {salle_nom}",
+            "<b>Date :</b> {date}",
+            "<b>Raison du refus :</b> {raison_refus}",
+        ],
+        "kind": "danger",
+        "placeholders": ["nom_demandeur", "salle_nom", "date", "raison_refus"],
+    },
+}
+
+async def render_email_template(key: str, **kwargs):
+    """Returns (subject, rendered_html) for a template key, applying any DB
+    override and substituting {placeholders} from kwargs. Never raises on a
+    missing placeholder — falls back to the raw (unsubstituted) text so a
+    typo in a custom template can't break the underlying workflow action."""
+    default = DEFAULT_EMAIL_TEMPLATES[key]
+    stored = await db.email_templates.find_one({"key": key}, {"_id": 0})
+    subject = (stored or {}).get("subject") or default["subject"]
+    body_lines = (stored or {}).get("body_lines") or default["body_lines"]
+
+    def safe_format(s: str) -> str:
+        try:
+            return s.format(**kwargs)
+        except Exception:
+            return s
+
+    rendered_subject = safe_format(subject)
+    rendered_lines = [safe_format(line) for line in body_lines]
+    return rendered_subject, email_template(rendered_subject, rendered_lines, kind=default["kind"])
+
+# ==================== CONFIGURABLE SALLES NOTIFICATION RECIPIENTS ====================
+# Which internal address(es) get notified for each Salles case, editable from
+# Salles > Notifications. Each recipient entry is either:
+#   {"type": "technicien", "id": "..."} -> resolved to that technicien's
+#       *current* email at send time (e.g. picking Paul here means his own
+#       profile email is always used, even if he updates it later)
+#   {"type": "email", "value": "..."}   -> a fixed address
+# Falls back to SALLES_NOTIFY_EMAIL if nothing is configured for a case.
+SALLES_NOTIFICATION_CASES = {
+    "nouvelle_demande": "Nouvelle demande de réservation à valider",
+    "confirmation": "Copie interne lors de la validation d'une réservation",
+}
+
+async def resolve_case_recipients(case: str) -> List[str]:
+    settings = await db.notification_settings.find_one({"case": case}, {"_id": 0})
+    recipients_config = (settings or {}).get("recipients", [])
+    emails: List[str] = []
+    for r in recipients_config:
+        if r.get("type") == "technicien":
+            tech = await db.techniciens.find_one({"id": r.get("id")}, {"_id": 0})
+            if tech and tech.get("email"):
+                emails.append(tech["email"])
+        elif r.get("type") == "email" and r.get("value"):
+            emails.append(r["value"])
+    if not emails and SALLES_NOTIFY_EMAIL:
+        emails = [SALLES_NOTIFY_EMAIL]
+    seen = set()
+    result = []
+    for e in emails:
+        if e and e not in seen:
+            seen.add(e)
+            result.append(e)
+    return result
 
 async def log_action(user_id: str, user_name: str, action: str, details: str):
     log_entry = {
@@ -2389,19 +2532,22 @@ async def create_public_reservation(token: str, data: ReservationCreate):
     }
     await db.reservations.insert_one(reservation)
 
-    fire_and_forget_email(data.email, "Demande de réservation reçue", email_template(
-        "Votre demande de réservation a bien été reçue",
-        [f"Bonjour {data.nom_demandeur},", f"<b>Salle :</b> {salle['nom']}", f"<b>Date :</b> {data.date}",
-         f"<b>Créneau :</b> {creneau['nom']} ({creneau['heure_debut']}-{creneau['heure_fin']})",
-         "Elle est en attente de validation — vous recevrez un email dès qu'elle sera traitée."],
-        kind="pending"
-    ))
-    fire_and_forget_email(SALLES_NOTIFY_EMAIL, "Nouvelle demande de réservation à valider", email_template(
-        "Une nouvelle demande de réservation attend une validation",
-        ["Bonjour,", f"<b>Demandeur :</b> {data.nom_demandeur}", f"<b>Salle :</b> {salle['nom']}", f"<b>Date :</b> {data.date}",
-         f"<b>Créneau :</b> {creneau['nom']}", f"<b>Raison :</b> {data.raison}"],
-        kind="pending"
-    ))
+    subject_recue, html_recue = await render_email_template(
+        "reservation_recue",
+        nom_demandeur=data.nom_demandeur, salle_nom=salle['nom'], date=data.date,
+        creneau_nom=creneau['nom'], heure_debut=creneau['heure_debut'], heure_fin=creneau['heure_fin'],
+        raison=data.raison,
+    )
+    fire_and_forget_email(data.email, subject_recue, html_recue)
+
+    subject_valider, html_valider = await render_email_template(
+        "reservation_a_valider",
+        nom_demandeur=data.nom_demandeur, salle_nom=salle['nom'], date=data.date,
+        creneau_nom=creneau['nom'], heure_debut=creneau['heure_debut'], heure_fin=creneau['heure_fin'],
+        raison=data.raison,
+    )
+    for recipient in await resolve_case_recipients("nouvelle_demande"):
+        fire_and_forget_email(recipient, subject_valider, html_valider)
 
     return ReservationResponse(**reservation)
 
@@ -2445,12 +2591,14 @@ async def validate_reservation(reservation_id: str, current_user: dict = Depends
     if result.modified_count == 0:
         raise HTTPException(status_code=404, detail="Réservation non trouvée ou déjà traitée")
     await log_action(current_user['id'], current_user['full_name'], "Validation réservation", f"Réservation validée: {reservation_id}")
-    fire_and_forget_email(reservation.get('email'), "Réservation validée", email_template(
-        "Votre réservation a été validée",
-        [f"Bonjour {reservation.get('nom_demandeur', '')},", f"<b>Salle :</b> {reservation['salle_nom']}", f"<b>Date :</b> {reservation['date']}",
-         f"<b>Créneau :</b> {reservation['creneau_nom']} ({reservation['heure_debut']}-{reservation['heure_fin']})"],
-        kind="success"
-    ))
+    subject_val, html_val = await render_email_template(
+        "reservation_validee",
+        nom_demandeur=reservation.get('nom_demandeur', ''), salle_nom=reservation['salle_nom'], date=reservation['date'],
+        creneau_nom=reservation['creneau_nom'], heure_debut=reservation['heure_debut'], heure_fin=reservation['heure_fin'],
+    )
+    fire_and_forget_email(reservation.get('email'), subject_val, html_val)
+    for recipient in await resolve_case_recipients("confirmation"):
+        fire_and_forget_email(recipient, f"[Confirmation] {subject_val}", html_val)
     return {"message": "Réservation validée"}
 
 @api_router.put("/reservations/{reservation_id}/reject")
@@ -2471,12 +2619,12 @@ async def reject_reservation(reservation_id: str, data: RejectReservationRequest
     if result.modified_count == 0:
         raise HTTPException(status_code=404, detail="Réservation non trouvée ou déjà traitée")
     await log_action(current_user['id'], current_user['full_name'], "Refus réservation", f"Réservation refusée: {reservation_id} - Raison: {data.raison_refus}")
-    fire_and_forget_email(reservation.get('email'), "Réservation refusée", email_template(
-        "Votre réservation n'a pas été retenue",
-        [f"Bonjour {reservation.get('nom_demandeur', '')},", f"<b>Salle :</b> {reservation['salle_nom']}", f"<b>Date :</b> {reservation['date']}",
-         f"<b>Raison du refus :</b> {data.raison_refus}"],
-        kind="danger"
-    ))
+    subject_ref, html_ref = await render_email_template(
+        "reservation_refusee",
+        nom_demandeur=reservation.get('nom_demandeur', ''), salle_nom=reservation['salle_nom'], date=reservation['date'],
+        raison_refus=data.raison_refus,
+    )
+    fire_and_forget_email(reservation.get('email'), subject_ref, html_ref)
     return {"message": "Réservation refusée"}
 
 @api_router.post("/reservations/admin", response_model=ReservationResponse)
@@ -2545,6 +2693,98 @@ async def delete_reservation(reservation_id: str, current_user: dict = Depends(g
         raise HTTPException(status_code=404, detail="Réservation non trouvée")
     await log_action(current_user['id'], current_user['full_name'], "Suppression réservation", f"Réservation supprimée: {reservation_id}")
     return {"message": "Réservation supprimée"}
+
+# ==================== SALLES NOTIFICATIONS SETTINGS ====================
+# Backs the "Notifications" tab in Salles: lets an Admin/Responsable edit the
+# wording of the 4 reservation emails, and lets an Admin choose who receives
+# the two internal-facing ones (per SALLES_NOTIFICATION_CASES above).
+
+@api_router.get("/email-templates")
+async def get_email_templates(current_user: dict = Depends(get_current_user)):
+    check_access(current_user, ["Super Admin", "Admin", "Responsable"])
+    stored = await db.email_templates.find({}, {"_id": 0}).to_list(100)
+    stored_map = {t["key"]: t for t in stored}
+    result = []
+    for key, default in DEFAULT_EMAIL_TEMPLATES.items():
+        override = stored_map.get(key, {})
+        result.append({
+            "key": key,
+            "label": default["label"],
+            "subject": override.get("subject") or default["subject"],
+            "body_lines": override.get("body_lines") or default["body_lines"],
+            "kind": default["kind"],
+            "placeholders": default["placeholders"],
+            "is_customized": key in stored_map,
+        })
+    return result
+
+class EmailTemplateUpdate(BaseModel):
+    subject: str
+    body_lines: List[str]
+
+@api_router.put("/email-templates/{key}")
+async def update_email_template(key: str, data: EmailTemplateUpdate, current_user: dict = Depends(get_current_user)):
+    check_access(current_user, ["Super Admin", "Admin", "Responsable"])
+    if key not in DEFAULT_EMAIL_TEMPLATES:
+        raise HTTPException(status_code=404, detail="Modèle inconnu")
+    await db.email_templates.update_one(
+        {"key": key},
+        {"$set": {"key": key, "subject": data.subject, "body_lines": data.body_lines}},
+        upsert=True
+    )
+    await log_action(current_user['id'], current_user['full_name'], "Modification modèle email", f"Modèle modifié: {key}")
+    return {"message": "Modèle mis à jour"}
+
+@api_router.post("/email-templates/{key}/reset")
+async def reset_email_template(key: str, current_user: dict = Depends(get_current_user)):
+    check_access(current_user, ["Super Admin", "Admin", "Responsable"])
+    if key not in DEFAULT_EMAIL_TEMPLATES:
+        raise HTTPException(status_code=404, detail="Modèle inconnu")
+    await db.email_templates.delete_one({"key": key})
+    await log_action(current_user['id'], current_user['full_name'], "Réinitialisation modèle email", f"Modèle réinitialisé: {key}")
+    return {"message": "Modèle réinitialisé"}
+
+class NotificationRecipient(BaseModel):
+    type: str  # "technicien" | "email"
+    id: Optional[str] = None       # technicien id, if type == "technicien"
+    value: Optional[str] = None    # raw email, if type == "email"
+
+class NotificationSettingsUpdate(BaseModel):
+    recipients: List[NotificationRecipient]
+
+@api_router.get("/salles/notification-settings")
+async def get_salles_notification_settings(current_user: dict = Depends(get_current_user)):
+    check_access(current_user, ["Super Admin", "Admin", "Responsable"])
+    result = {}
+    for case, label in SALLES_NOTIFICATION_CASES.items():
+        settings = await db.notification_settings.find_one({"case": case}, {"_id": 0})
+        recipients = (settings or {}).get("recipients", [])
+        resolved = []
+        for r in recipients:
+            if r.get("type") == "technicien":
+                tech = await db.techniciens.find_one({"id": r.get("id")}, {"_id": 0})
+                resolved.append({
+                    "type": "technicien", "id": r.get("id"),
+                    "nom": tech["nom"] if tech else "(technicien supprimé)",
+                    "email": tech.get("email") if tech else None,
+                })
+            else:
+                resolved.append({"type": "email", "value": r.get("value")})
+        result[case] = {"label": label, "recipients": resolved}
+    return result
+
+@api_router.put("/salles/notification-settings/{case}")
+async def update_salles_notification_settings(case: str, data: NotificationSettingsUpdate, current_user: dict = Depends(get_current_user)):
+    check_access(current_user, ["Super Admin", "Admin"])
+    if case not in SALLES_NOTIFICATION_CASES:
+        raise HTTPException(status_code=404, detail="Cas de notification inconnu")
+    await db.notification_settings.update_one(
+        {"case": case},
+        {"$set": {"case": case, "recipients": [r.model_dump() for r in data.recipients]}},
+        upsert=True
+    )
+    await log_action(current_user['id'], current_user['full_name'], "Modification destinataires notification", f"Cas: {case}")
+    return {"message": "Destinataires mis à jour"}
 
 # ==================== ENHANCED GROUPS ROUTES ====================
 
