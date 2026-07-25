@@ -539,15 +539,28 @@ def is_direction_or_admin(user: dict) -> bool:
 # ==================== EMAIL NOTIFICATIONS ====================
 # Free SMTP relay (e.g. a dedicated Gmail account + App Password). Configure via
 # Railway environment variables: SMTP_USER, SMTP_PASSWORD, and optionally
-# SMTP_HOST/SMTP_PORT/EMAIL_FROM_NAME/ADMIN_NOTIFY_EMAIL. If unset, emails are
-# silently skipped so the rest of the app keeps working.
+# SMTP_HOST/SMTP_PORT/EMAIL_FROM_NAME. If unset, emails are silently skipped so
+# the rest of the app keeps working.
+#
+# Recipient routing: pav.resa (SMTP_USER) is only the *sending* mailbox — a
+# tunnel — not necessarily who reads the notifications. Real recipients are
+# configured per domain so each team only gets what concerns it:
+#   SALLES_NOTIFY_EMAIL         -> Salles/réservations (destinataire réel : Paul)
+#   COORDINATION_NOTIFY_EMAIL   -> Devis + Formations   (destinataires réels : Delphine, Winchel)
+#   ADMIN_NOTIFY_EMAIL          -> RGPD / administration générale (fallback des deux ci-dessus)
+# All three currently point to the same test address (guichardelane1@gmail.com)
+# until the real addresses for Paul/Delphine/Winchel are confirmed and set in
+# Railway — see the two PAV Manager docx documents for the exact variable names.
 SMTP_HOST = os.environ.get('SMTP_HOST', 'smtp.gmail.com')
 SMTP_PORT = int(os.environ.get('SMTP_PORT', '587'))
 SMTP_USER = os.environ.get('SMTP_USER')
 SMTP_PASSWORD = os.environ.get('SMTP_PASSWORD')
 EMAIL_FROM_NAME = os.environ.get('EMAIL_FROM_NAME', 'PAV Manager')
 ADMIN_NOTIFY_EMAIL = os.environ.get('ADMIN_NOTIFY_EMAIL') or SMTP_USER
+SALLES_NOTIFY_EMAIL = os.environ.get('SALLES_NOTIFY_EMAIL') or ADMIN_NOTIFY_EMAIL
+COORDINATION_NOTIFY_EMAIL = os.environ.get('COORDINATION_NOTIFY_EMAIL') or ADMIN_NOTIFY_EMAIL
 EMAIL_ENABLED = bool(SMTP_USER and SMTP_PASSWORD)
+APP_URL = os.environ.get('APP_URL', 'https://pav-manager-app.netlify.app')
 
 def _send_email_sync(to: str, subject: str, body_html: str):
     msg = MIMEMultipart('alternative')
@@ -572,16 +585,33 @@ async def notify_email(to: Optional[str], subject: str, body_html: str):
     except Exception as e:
         logger.warning(f"Email non envoyé à {to} ({subject}): {e}")
 
-def email_template(title: str, lines: List[str], accent: str = "#B91C1C") -> str:
+# Visual "kind" of a notification: controls the accent color and the small
+# status badge shown under the title, so recipients can tell at a glance
+# whether an email is a pending action, a confirmation, or a refusal.
+EMAIL_KINDS = {
+    "pending": {"accent": "#D97706", "bg": "#FFFBEB", "label": "EN ATTENTE"},
+    "success": {"accent": "#059669", "bg": "#ECFDF5", "label": "VALIDÉ"},
+    "danger":  {"accent": "#DC2626", "bg": "#FEF2F2", "label": "REFUSÉ"},
+    "info":    {"accent": "#2563EB", "bg": "#EFF6FF", "label": "INFORMATION"},
+}
+
+def email_template(title: str, lines: List[str], kind: str = "info") -> str:
+    style = EMAIL_KINDS.get(kind, EMAIL_KINDS["info"])
     rows = "".join(f"<p style='margin:0 0 10px 0;color:#374151;font-size:14px;line-height:1.5'>{l}</p>" for l in lines)
     return f"""
-    <div style="font-family:Arial,Helvetica,sans-serif;max-width:520px;margin:0 auto;padding:24px;border:1px solid #e5e7eb;border-radius:8px">
-      <div style="border-bottom:3px solid {accent};padding-bottom:12px;margin-bottom:16px">
-        <span style="font-size:18px;font-weight:bold;color:#1F2937">PAV Manager</span>
+    <div style="font-family:Arial,Helvetica,sans-serif;max-width:540px;margin:0 auto;padding:0;border:1px solid #e5e7eb;border-radius:10px;overflow:hidden">
+      <div style="background:#111827;padding:18px 24px;">
+        <span style="font-size:17px;font-weight:bold;color:#ffffff;letter-spacing:0.5px">PAV MANAGER</span>
       </div>
-      <h2 style="color:#1F2937;font-size:16px;margin:0 0 14px 0">{title}</h2>
-      {rows}
-      <p style="margin-top:20px;font-size:12px;color:#9CA3AF">Notification automatique — merci de ne pas répondre directement à cet email.</p>
+      <div style="padding:24px">
+        <span style="display:inline-block;background:{style['bg']};color:{style['accent']};font-size:11px;font-weight:bold;letter-spacing:0.5px;padding:4px 10px;border-radius:999px;margin-bottom:12px">{style['label']}</span>
+        <h2 style="color:#111827;font-size:17px;margin:0 0 16px 0;line-height:1.4">{title}</h2>
+        {rows}
+        <a href="{APP_URL}" style="display:inline-block;margin-top:16px;background:{style['accent']};color:#ffffff;text-decoration:none;font-size:13px;font-weight:bold;padding:10px 18px;border-radius:6px">Ouvrir PAV Manager</a>
+      </div>
+      <div style="background:#F9FAFB;padding:14px 24px;border-top:1px solid #E5E7EB">
+        <p style="margin:0;font-size:11px;color:#9CA3AF">Notification automatique du département Production Audiovisuelle — merci de ne pas répondre directement à cet email.</p>
+      </div>
     </div>
     """
 
@@ -928,7 +958,8 @@ async def request_account_deletion(current_user: dict = Depends(get_current_user
     await notify_email(ADMIN_NOTIFY_EMAIL, "Demande RGPD — suppression de compte", email_template(
         "Un utilisateur demande la suppression de son compte",
         [f"<b>Utilisateur :</b> {current_user['full_name']} ({current_user['username']})",
-         "À traiter sous 30 jours conformément au RGPD, depuis Administration → Utilisateurs."]
+         "À traiter sous 30 jours conformément au RGPD, depuis Administration → Utilisateurs."],
+        kind="pending"
     ))
     return {"message": "Votre demande de suppression a été transmise à l'administration et sera traitée sous 30 jours."}
 
@@ -1399,9 +1430,10 @@ async def create_devis(data: DevisCreate, current_user: dict = Depends(get_curre
     }
     await db.devis.insert_one(devis)
     await log_action(current_user['id'], current_user['full_name'], "Création devis", f"Devis créé: {data.titre}")
-    await notify_email(ADMIN_NOTIFY_EMAIL, "Nouveau devis en attente de validation", email_template(
+    await notify_email(COORDINATION_NOTIFY_EMAIL, "Nouveau devis en attente de validation", email_template(
         "Un nouveau devis attend une validation",
-        [f"<b>Titre :</b> {data.titre}", f"<b>Montant :</b> {data.montant} €", f"<b>Demandé par :</b> {current_user['full_name']}"]
+        ["Bonjour,", f"<b>Titre :</b> {data.titre}", f"<b>Montant :</b> {data.montant} €", f"<b>Demandé par :</b> {current_user['full_name']}"],
+        kind="pending"
     ))
     return DevisResponse(**devis)
 
@@ -1419,7 +1451,9 @@ async def validate_devis(devis_id: str, current_user: dict = Depends(get_current
         raise HTTPException(status_code=404, detail="Devis non trouvé ou déjà traité")
     await log_action(current_user['id'], current_user['full_name'], "Validation devis", f"Devis validé: {devis_id}")
     await notify_email(await get_user_email(devis['created_by']), "Devis validé", email_template(
-        "Votre devis a été validé", [f"<b>Titre :</b> {devis['titre']}", f"<b>Montant :</b> {devis['montant']} €"], accent="#059669"
+        "Votre devis a été validé",
+        [f"Bonjour {devis.get('created_by_name', '')},", f"<b>Titre :</b> {devis['titre']}", f"<b>Montant :</b> {devis['montant']} €"],
+        kind="success"
     ))
     return {"message": "Devis validé"}
 
@@ -1437,7 +1471,9 @@ async def reject_devis(devis_id: str, current_user: dict = Depends(get_current_u
         raise HTTPException(status_code=404, detail="Devis non trouvé ou déjà traité")
     await log_action(current_user['id'], current_user['full_name'], "Refus devis", f"Devis refusé: {devis_id}")
     await notify_email(await get_user_email(devis['created_by']), "Devis refusé", email_template(
-        "Votre devis a été refusé", [f"<b>Titre :</b> {devis['titre']}", f"<b>Montant :</b> {devis['montant']} €"]
+        "Votre devis a été refusé",
+        [f"Bonjour {devis.get('created_by_name', '')},", f"<b>Titre :</b> {devis['titre']}", f"<b>Montant :</b> {devis['montant']} €"],
+        kind="danger"
     ))
     return {"message": "Devis refusé"}
 
@@ -1455,7 +1491,9 @@ async def revert_devis(devis_id: str, current_user: dict = Depends(get_current_u
     await log_action(current_user['id'], current_user['full_name'], "Retour devis en attente", f"Devis remis en attente: {devis_id}")
     if devis:
         await notify_email(await get_user_email(devis['created_by']), "Devis remis en attente", email_template(
-            "Votre devis a été remis en attente de validation", [f"<b>Titre :</b> {devis['titre']}"]
+            "Votre devis a été remis en attente de validation",
+            [f"Bonjour {devis.get('created_by_name', '')},", f"<b>Titre :</b> {devis['titre']}"],
+            kind="pending"
         ))
     return {"message": "Devis remis en attente"}
 
@@ -1531,9 +1569,10 @@ async def create_formation(data: FormationCreate, current_user: dict = Depends(g
     }
     await db.formations.insert_one(formation)
     await log_action(current_user['id'], current_user['full_name'], "Demande formation", f"Formation demandée: {data.titre}")
-    await notify_email(ADMIN_NOTIFY_EMAIL, "Nouvelle demande de formation", email_template(
+    await notify_email(COORDINATION_NOTIFY_EMAIL, "Nouvelle demande de formation", email_template(
         "Une nouvelle demande de formation attend la Coordination",
-        [f"<b>Titre :</b> {data.titre}", f"<b>Demandé par :</b> {current_user['full_name']}", f"<b>Date souhaitée :</b> {data.date_souhaitee}"]
+        ["Bonjour,", f"<b>Titre :</b> {data.titre}", f"<b>Demandé par :</b> {current_user['full_name']}", f"<b>Date souhaitée :</b> {data.date_souhaitee}"],
+        kind="pending"
     ))
     return FormationResponse(**formation)
 
@@ -1582,10 +1621,14 @@ async def coordination_validate_formation(formation_id: str, data: FormationCoor
     formation = await db.formations.find_one({"id": formation_id}, {"_id": 0})
     await notify_email(await get_user_email(formation['created_by']), "Votre demande de formation avance", email_template(
         "Votre demande de formation est transmise pour validation finale",
-        [f"<b>Titre :</b> {formation['titre']}", f"<b>Formateur :</b> {formation.get('formateur') or '-'}", f"<b>Lieu :</b> {formation.get('lieu') or '-'}"]
+        [f"Bonjour {formation.get('created_by_name', '')},", f"<b>Titre :</b> {formation['titre']}",
+         f"<b>Formateur :</b> {formation.get('formateur') or '-'}", f"<b>Lieu :</b> {formation.get('lieu') or '-'}"],
+        kind="pending"
     ))
-    await notify_email(ADMIN_NOTIFY_EMAIL, "Formation en attente de validation finale", email_template(
-        "Une formation attend la validation finale de la Direction", [f"<b>Titre :</b> {formation['titre']}"]
+    await notify_email(COORDINATION_NOTIFY_EMAIL, "Formation en attente de validation finale", email_template(
+        "Une formation attend la validation finale de la Direction",
+        ["Bonjour,", f"<b>Titre :</b> {formation['titre']}"],
+        kind="pending"
     ))
     return FormationResponse(**formation)
 
@@ -1608,7 +1651,9 @@ async def coordination_reject_formation(formation_id: str, data: FormationReject
     await log_action(current_user['id'], current_user['full_name'], "Refus formation (Coordination)", f"Formation refusée: {formation_id}")
     formation = await db.formations.find_one({"id": formation_id}, {"_id": 0})
     await notify_email(await get_user_email(formation['created_by']), "Demande de formation refusée", email_template(
-        "Votre demande de formation a été refusée", [f"<b>Titre :</b> {formation['titre']}", f"<b>Motif :</b> {data.motif or '-'}"]
+        "Votre demande de formation a été refusée",
+        [f"Bonjour {formation.get('created_by_name', '')},", f"<b>Titre :</b> {formation['titre']}", f"<b>Motif :</b> {data.motif or '-'}"],
+        kind="danger"
     ))
     return FormationResponse(**formation)
 
@@ -1630,7 +1675,9 @@ async def final_validate_formation(formation_id: str, current_user: dict = Depen
     await log_action(current_user['id'], current_user['full_name'], "Validation finale formation", f"Formation validée: {formation_id}")
     formation = await db.formations.find_one({"id": formation_id}, {"_id": 0})
     await notify_email(await get_user_email(formation['created_by']), "Formation validée", email_template(
-        "Votre demande de formation a été validée", [f"<b>Titre :</b> {formation['titre']}", f"<b>Date souhaitée :</b> {formation.get('date_souhaitee') or '-'}"], accent="#059669"
+        "Votre demande de formation a été validée",
+        [f"Bonjour {formation.get('created_by_name', '')},", f"<b>Titre :</b> {formation['titre']}", f"<b>Date souhaitée :</b> {formation.get('date_souhaitee') or '-'}"],
+        kind="success"
     ))
     return FormationResponse(**formation)
 
@@ -1653,7 +1700,9 @@ async def final_reject_formation(formation_id: str, data: FormationRejectReason,
     await log_action(current_user['id'], current_user['full_name'], "Refus formation (Direction)", f"Formation refusée: {formation_id}")
     formation = await db.formations.find_one({"id": formation_id}, {"_id": 0})
     await notify_email(await get_user_email(formation['created_by']), "Demande de formation refusée", email_template(
-        "Votre demande de formation a été refusée en validation finale", [f"<b>Titre :</b> {formation['titre']}", f"<b>Motif :</b> {data.motif or '-'}"]
+        "Votre demande de formation a été refusée en validation finale",
+        [f"Bonjour {formation.get('created_by_name', '')},", f"<b>Titre :</b> {formation['titre']}", f"<b>Motif :</b> {data.motif or '-'}"],
+        kind="danger"
     ))
     return FormationResponse(**formation)
 
@@ -2297,14 +2346,16 @@ async def create_public_reservation(token: str, data: ReservationCreate):
 
     await notify_email(data.email, "Demande de réservation reçue", email_template(
         "Votre demande de réservation a bien été reçue",
-        [f"<b>Salle :</b> {salle['nom']}", f"<b>Date :</b> {data.date}",
+        [f"Bonjour {data.nom_demandeur},", f"<b>Salle :</b> {salle['nom']}", f"<b>Date :</b> {data.date}",
          f"<b>Créneau :</b> {creneau['nom']} ({creneau['heure_debut']}-{creneau['heure_fin']})",
-         "Elle est en attente de validation — vous recevrez un email dès qu'elle sera traitée."]
+         "Elle est en attente de validation — vous recevrez un email dès qu'elle sera traitée."],
+        kind="pending"
     ))
-    await notify_email(ADMIN_NOTIFY_EMAIL, "Nouvelle demande de réservation à valider", email_template(
+    await notify_email(SALLES_NOTIFY_EMAIL, "Nouvelle demande de réservation à valider", email_template(
         "Une nouvelle demande de réservation attend une validation",
-        [f"<b>Demandeur :</b> {data.nom_demandeur}", f"<b>Salle :</b> {salle['nom']}", f"<b>Date :</b> {data.date}",
-         f"<b>Créneau :</b> {creneau['nom']}", f"<b>Raison :</b> {data.raison}"]
+        ["Bonjour,", f"<b>Demandeur :</b> {data.nom_demandeur}", f"<b>Salle :</b> {salle['nom']}", f"<b>Date :</b> {data.date}",
+         f"<b>Créneau :</b> {creneau['nom']}", f"<b>Raison :</b> {data.raison}"],
+        kind="pending"
     ))
 
     return ReservationResponse(**reservation)
@@ -2351,9 +2402,9 @@ async def validate_reservation(reservation_id: str, current_user: dict = Depends
     await log_action(current_user['id'], current_user['full_name'], "Validation réservation", f"Réservation validée: {reservation_id}")
     await notify_email(reservation.get('email'), "Réservation validée", email_template(
         "Votre réservation a été validée",
-        [f"<b>Salle :</b> {reservation['salle_nom']}", f"<b>Date :</b> {reservation['date']}",
+        [f"Bonjour {reservation.get('nom_demandeur', '')},", f"<b>Salle :</b> {reservation['salle_nom']}", f"<b>Date :</b> {reservation['date']}",
          f"<b>Créneau :</b> {reservation['creneau_nom']} ({reservation['heure_debut']}-{reservation['heure_fin']})"],
-        accent="#059669"
+        kind="success"
     ))
     return {"message": "Réservation validée"}
 
@@ -2377,8 +2428,9 @@ async def reject_reservation(reservation_id: str, data: RejectReservationRequest
     await log_action(current_user['id'], current_user['full_name'], "Refus réservation", f"Réservation refusée: {reservation_id} - Raison: {data.raison_refus}")
     await notify_email(reservation.get('email'), "Réservation refusée", email_template(
         "Votre réservation n'a pas été retenue",
-        [f"<b>Salle :</b> {reservation['salle_nom']}", f"<b>Date :</b> {reservation['date']}",
-         f"<b>Raison du refus :</b> {data.raison_refus}"]
+        [f"Bonjour {reservation.get('nom_demandeur', '')},", f"<b>Salle :</b> {reservation['salle_nom']}", f"<b>Date :</b> {reservation['date']}",
+         f"<b>Raison du refus :</b> {data.raison_refus}"],
+        kind="danger"
     ))
     return {"message": "Réservation refusée"}
 
@@ -2434,8 +2486,9 @@ async def create_admin_reservation(data: AdminReservationCreate, current_user: d
     if data.email:
         title = "Réunion confirmée" if data.statut == "Validée" else "Demande de réservation reçue"
         await notify_email(data.email, title, email_template(
-            title, [f"<b>Salle :</b> {salle['nom']}", f"<b>Date :</b> {data.date}", f"<b>Créneau :</b> {creneau['nom']} ({creneau['heure_debut']}-{creneau['heure_fin']})"],
-            accent="#059669" if data.statut == "Validée" else "#B91C1C"
+            title,
+            [f"Bonjour {data.nom_demandeur},", f"<b>Salle :</b> {salle['nom']}", f"<b>Date :</b> {data.date}", f"<b>Créneau :</b> {creneau['nom']} ({creneau['heure_debut']}-{creneau['heure_fin']})"],
+            kind="success" if data.statut == "Validée" else "pending"
         ))
     return ReservationResponse(**reservation)
 
