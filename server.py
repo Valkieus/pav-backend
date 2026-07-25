@@ -431,12 +431,16 @@ class AdminReservationCreate(BaseModel):
 class MaintenanceModeUpdate(BaseModel):
     is_active: bool
     message: Optional[str] = None
+    scope: Optional[str] = "site"  # "site" = whole app, "page" = a single page path
+    page_path: Optional[str] = None  # required when scope == "page"
 
 class MaintenanceModeResponse(BaseModel):
     is_active: bool
     message: Optional[str] = None
     activated_by: Optional[str] = None
     activated_at: Optional[str] = None
+    scope: Optional[str] = "site"
+    page_path: Optional[str] = None
 
 # ==================== GROUP MODELS (ENHANCED) ====================
 
@@ -2258,31 +2262,42 @@ async def get_maintenance_mode():
     """Get maintenance mode status (public endpoint)"""
     maintenance = await db.settings.find_one({"key": "maintenance_mode"}, {"_id": 0})
     if not maintenance:
-        return MaintenanceModeResponse(is_active=False, message=None, activated_by=None, activated_at=None)
-    return MaintenanceModeResponse(**maintenance.get("value", {}))
+        return MaintenanceModeResponse(is_active=False, message=None, activated_by=None, activated_at=None, scope="site", page_path=None)
+    stored = maintenance.get("value", {})
+    stored.setdefault("scope", "site")
+    stored.setdefault("page_path", None)
+    return MaintenanceModeResponse(**stored)
 
 @api_router.put("/maintenance", response_model=MaintenanceModeResponse)
 async def update_maintenance_mode(data: MaintenanceModeUpdate, current_user: dict = Depends(get_current_user)):
     """Toggle maintenance mode (Super Admin only)"""
     check_access(current_user, ["Super Admin"])
-    
+
+    scope = data.scope if data.scope in ("site", "page") else "site"
+    page_path = data.page_path if scope == "page" else None
+    if scope == "page" and not page_path:
+        raise HTTPException(status_code=400, detail="page_path requis lorsque la portée est 'page'")
+
     now = datetime.now(timezone.utc).isoformat()
     value = {
         "is_active": data.is_active,
         "message": data.message,
         "activated_by": current_user['full_name'] if data.is_active else None,
-        "activated_at": now if data.is_active else None
+        "activated_at": now if data.is_active else None,
+        "scope": scope,
+        "page_path": page_path
     }
-    
+
     await db.settings.update_one(
         {"key": "maintenance_mode"},
         {"$set": {"key": "maintenance_mode", "value": value, "updated_at": now}},
         upsert=True
     )
-    
-    action = "Activation mode maintenance" if data.is_active else "Désactivation mode maintenance"
+
+    scope_label = "site complet" if scope == "site" else f"page {page_path}"
+    action = f"Activation mode maintenance ({scope_label})" if data.is_active else "Désactivation mode maintenance"
     await log_action(current_user['id'], current_user['full_name'], action, data.message or "")
-    
+
     return MaintenanceModeResponse(**value)
 
 # ==================== STARTUP ====================
