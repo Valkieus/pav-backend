@@ -79,10 +79,12 @@ class UserCreate(BaseModel):
     password: str
     full_name: str
     niveau_acces: str
+    branches: Optional[List[str]] = []  # Scopes Dashboard/Effectif visibility for Gestionnaire/Responsable. Empty = unrestricted.
 
 class UserUpdate(BaseModel):
     full_name: Optional[str] = None
     niveau_acces: Optional[str] = None
+    branches: Optional[List[str]] = None
 
 class UserLogin(BaseModel):
     username: str
@@ -96,6 +98,7 @@ class UserResponse(BaseModel):
     username: str
     full_name: str
     niveau_acces: str
+    branches: Optional[List[str]] = []
     created_at: str
     is_active: bool
     must_change_password: Optional[bool] = False
@@ -738,6 +741,7 @@ async def login(data: UserLogin):
             username=user['username'],
             full_name=user['full_name'],
             niveau_acces=user['niveau_acces'],
+            branches=user.get('branches', []),
             created_at=user['created_at'],
             is_active=user.get('is_active', True)
         )
@@ -750,6 +754,7 @@ async def get_me(current_user: dict = Depends(get_current_user)):
         username=current_user['username'],
         full_name=current_user['full_name'],
         niveau_acces=current_user['niveau_acces'],
+        branches=current_user.get('branches', []),
         created_at=current_user['created_at'],
         is_active=current_user.get('is_active', True),
         must_change_password=current_user.get('must_change_password', False)
@@ -768,6 +773,7 @@ async def create_user(data: UserCreate, current_user: dict = Depends(get_current
         "password": hash_password(data.password),
         "full_name": data.full_name,
         "niveau_acces": data.niveau_acces,
+        "branches": data.branches or [],
         "created_at": datetime.now(timezone.utc).isoformat(),
         "is_active": True,
         "must_change_password": True  # Force password change on first login
@@ -777,7 +783,7 @@ async def create_user(data: UserCreate, current_user: dict = Depends(get_current
     
     return UserResponse(
         id=user['id'], username=user['username'], full_name=user['full_name'],
-        niveau_acces=user['niveau_acces'], created_at=user['created_at'], is_active=user['is_active'],
+        niveau_acces=user['niveau_acces'], branches=user['branches'], created_at=user['created_at'], is_active=user['is_active'],
         must_change_password=user['must_change_password']
     )
 
@@ -789,6 +795,8 @@ async def update_user(user_id: str, data: UserUpdate, current_user: dict = Depen
         update_data["full_name"] = data.full_name
     if data.niveau_acces:
         update_data["niveau_acces"] = data.niveau_acces
+    if data.branches is not None:
+        update_data["branches"] = data.branches
     
     if not update_data:
         raise HTTPException(status_code=400, detail="Aucune donnée à modifier")
