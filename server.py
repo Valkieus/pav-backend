@@ -57,7 +57,7 @@ BRANCHES = ["Supervision", "Coordination", "Production", "Live", "Animation", "R
 SOUS_BRANCHES_LIVE = ["Incrustation", "Diffusion", "Cadreur", "Réalisation"]
 CATEGORIES_MATERIEL = ["Caméra", "Trépied", "Batterie", "Câble", "Câble HDMI", "Câble SDI", "Câble XLR", "Câble Ethernet", "Micro", "Son", "Lumière", "Moniteur", "Enregistreur", "Accessoire", "Autre"]
 STATUTS_DEVIS = ["En attente", "Validé", "Refusé", "Archivé"]
-STATUTS_FORMATION = ["En attente", "Validée", "Refusée", "Archivée"]
+STATUTS_FORMATION = ["En attente Coordination", "En attente validation finale", "Validée", "Refusée", "Archivée"]
 STATUTS_MATERIEL = ["Disponible", "En utilisation", "En maintenance", "Hors service", "Archivé"]
 STATUTS_RESERVATION = ["En attente", "Validée", "Refusée", "Annulée"]
 
@@ -228,18 +228,34 @@ class FormationCreate(BaseModel):
     date_souhaitee: str
     duree: str
 
+class FormationCoordinationValidate(BaseModel):
+    formateur: str
+    cursus: str
+    lieu: str
+    duree: Optional[str] = None  # Coordination may confirm/adjust the requested duration
+
+class FormationRejectReason(BaseModel):
+    motif: Optional[str] = None
+
 class FormationResponse(BaseModel):
     id: str
     titre: str
     description: str
     date_souhaitee: str
     duree: str
+    formateur: Optional[str] = None
+    cursus: Optional[str] = None
+    lieu: Optional[str] = None
     statut: str
     created_by: str
     created_by_name: str
     created_at: str
+    coordination_by: Optional[str] = None
+    coordination_at: Optional[str] = None
     validated_by: Optional[str] = None
     validated_at: Optional[str] = None
+    motif_refus: Optional[str] = None
+    refused_stage: Optional[str] = None  # "coordination" | "direction"
     is_archived: bool
 
 # Actualités models
@@ -493,6 +509,25 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
 def check_access(user: dict, required_levels: List[str]):
     if user['niveau_acces'] not in required_levels:
         raise HTTPException(status_code=403, detail="Accès non autorisé")
+
+def is_coordination_or_admin(user: dict) -> bool:
+    """Coordination step of the Formations workflow: Gestionnaire+ in the
+    Coordination branch, or Admin/Super Admin (who retain full visibility)."""
+    if user['niveau_acces'] in ("Admin", "Super Admin"):
+        return True
+    if user['niveau_acces'] in ("Gestionnaire", "Responsable", "Coordination") and "Coordination" in (user.get("branches") or []):
+        return True
+    return False
+
+def is_direction_or_admin(user: dict) -> bool:
+    """Final validation step of the Formations workflow: department-wide
+    Responsables (branches empty = unrestricted oversight, e.g. Paul), or
+    Admin/Super Admin."""
+    if user['niveau_acces'] in ("Admin", "Super Admin"):
+        return True
+    if user['niveau_acces'] == "Responsable" and not (user.get("branches") or []):
+        return True
+    return False
 
 async def log_action(user_id: str, user_name: str, action: str, details: str):
     log_entry = {
@@ -1279,6 +1314,19 @@ async def reject_devis(devis_id: str, current_user: dict = Depends(get_current_u
     await log_action(current_user['id'], current_user['full_name'], "Refus devis", f"Devis refusé: {devis_id}")
     return {"message": "Devis refusé"}
 
+@api_router.put("/devis/{devis_id}/revert")
+async def revert_devis(devis_id: str, current_user: dict = Depends(get_current_user)):
+    """Send a Validé/Refusé devis back to 'En attente' so it can be re-reviewed."""
+    check_access(current_user, ["Super Admin", "Admin", "Responsable"])
+    result = await db.devis.update_one(
+        {"id": devis_id, "statut": {"$in": ["Validé", "Refusé"]}},
+        {"$set": {"statut": "En attente", "validated_by": None, "validated_at": None}}
+    )
+    if result.modified_count == 0:
+        raise HTTPException(status_code=404, detail="Devis non trouvé ou déjà en attente")
+    await log_action(current_user['id'], current_user['full_name'], "Retour devis en attente", f"Devis remis en attente: {devis_id}")
+    return {"message": "Devis remis en attente"}
+
 @api_router.put("/devis/{devis_id}")
 async def update_devis(devis_id: str, data: DevisCreate, current_user: dict = Depends(get_current_user)):
     fournisseur_nom = None
@@ -1334,12 +1382,19 @@ async def create_formation(data: FormationCreate, current_user: dict = Depends(g
     formation = {
         "id": str(uuid.uuid4()),
         **data.model_dump(),
-        "statut": "En attente",
+        "formateur": None,
+        "cursus": None,
+        "lieu": None,
+        "statut": "En attente Coordination",
         "created_by": current_user['id'],
         "created_by_name": current_user['full_name'],
         "created_at": datetime.now(timezone.utc).isoformat(),
+        "coordination_by": None,
+        "coordination_at": None,
         "validated_by": None,
         "validated_at": None,
+        "motif_refus": None,
+        "refused_stage": None,
         "is_archived": False
     }
     await db.formations.insert_one(formation)
@@ -1348,6 +1403,11 @@ async def create_formation(data: FormationCreate, current_user: dict = Depends(g
 
 @api_router.put("/formations/{formation_id}", response_model=FormationResponse)
 async def update_formation(formation_id: str, data: FormationCreate, current_user: dict = Depends(get_current_user)):
+    existing = await db.formations.find_one({"id": formation_id}, {"_id": 0})
+    if not existing:
+        raise HTTPException(status_code=404, detail="Formation non trouvée")
+    if existing["statut"] != "En attente Coordination":
+        raise HTTPException(status_code=400, detail="Cette demande a déjà été traitée par la Coordination et ne peut plus être modifiée")
     update_data = {
         "titre": data.titre,
         "description": data.description,
@@ -1355,36 +1415,95 @@ async def update_formation(formation_id: str, data: FormationCreate, current_use
         "duree": data.duree,
         "updated_at": datetime.now(timezone.utc).isoformat()
     }
-    result = await db.formations.update_one({"id": formation_id}, {"$set": update_data})
-    if result.modified_count == 0:
-        raise HTTPException(status_code=404, detail="Formation non trouvée")
+    await db.formations.update_one({"id": formation_id}, {"$set": update_data})
     await log_action(current_user['id'], current_user['full_name'], "Modification formation", f"Formation modifiée: {data.titre}")
     formation = await db.formations.find_one({"id": formation_id}, {"_id": 0})
     return FormationResponse(**formation)
 
-@api_router.put("/formations/{formation_id}/validate")
-async def validate_formation(formation_id: str, current_user: dict = Depends(get_current_user)):
-    check_access(current_user, ["Super Admin", "Admin", "Responsable"])
+@api_router.put("/formations/{formation_id}/coordination-validate", response_model=FormationResponse)
+async def coordination_validate_formation(formation_id: str, data: FormationCoordinationValidate, current_user: dict = Depends(get_current_user)):
+    """Coordination confirms the trainer, curriculum and location, then
+    transmits the request to Direction for final validation."""
+    if not is_coordination_or_admin(current_user):
+        raise HTTPException(status_code=403, detail="Réservé à la Coordination")
+    update = {
+        "formateur": data.formateur,
+        "cursus": data.cursus,
+        "lieu": data.lieu,
+        "statut": "En attente validation finale",
+        "coordination_by": current_user['full_name'],
+        "coordination_at": datetime.now(timezone.utc).isoformat()
+    }
+    if data.duree:
+        update["duree"] = data.duree
     result = await db.formations.update_one(
-        {"id": formation_id, "statut": "En attente"},
-        {"$set": {"statut": "Validée", "validated_by": current_user['full_name'], "validated_at": datetime.now(timezone.utc).isoformat()}}
+        {"id": formation_id, "statut": "En attente Coordination"},
+        {"$set": update}
     )
     if result.modified_count == 0:
         raise HTTPException(status_code=404, detail="Formation non trouvée ou déjà traitée")
-    await log_action(current_user['id'], current_user['full_name'], "Validation formation", f"Formation validée: {formation_id}")
-    return {"message": "Formation validée"}
+    await log_action(current_user['id'], current_user['full_name'], "Validation Coordination", f"Formation transmise pour validation finale: {formation_id}")
+    formation = await db.formations.find_one({"id": formation_id}, {"_id": 0})
+    return FormationResponse(**formation)
 
-@api_router.put("/formations/{formation_id}/reject")
-async def reject_formation(formation_id: str, current_user: dict = Depends(get_current_user)):
-    check_access(current_user, ["Super Admin", "Admin", "Responsable"])
+@api_router.put("/formations/{formation_id}/coordination-reject", response_model=FormationResponse)
+async def coordination_reject_formation(formation_id: str, data: FormationRejectReason, current_user: dict = Depends(get_current_user)):
+    if not is_coordination_or_admin(current_user):
+        raise HTTPException(status_code=403, detail="Réservé à la Coordination")
     result = await db.formations.update_one(
-        {"id": formation_id, "statut": "En attente"},
-        {"$set": {"statut": "Refusée", "validated_by": current_user['full_name'], "validated_at": datetime.now(timezone.utc).isoformat()}}
+        {"id": formation_id, "statut": "En attente Coordination"},
+        {"$set": {
+            "statut": "Refusée",
+            "refused_stage": "coordination",
+            "motif_refus": data.motif,
+            "coordination_by": current_user['full_name'],
+            "coordination_at": datetime.now(timezone.utc).isoformat()
+        }}
     )
     if result.modified_count == 0:
         raise HTTPException(status_code=404, detail="Formation non trouvée ou déjà traitée")
-    await log_action(current_user['id'], current_user['full_name'], "Refus formation", f"Formation refusée: {formation_id}")
-    return {"message": "Formation refusée"}
+    await log_action(current_user['id'], current_user['full_name'], "Refus formation (Coordination)", f"Formation refusée: {formation_id}")
+    formation = await db.formations.find_one({"id": formation_id}, {"_id": 0})
+    return FormationResponse(**formation)
+
+@api_router.put("/formations/{formation_id}/final-validate", response_model=FormationResponse)
+async def final_validate_formation(formation_id: str, current_user: dict = Depends(get_current_user)):
+    """Final validation by Direction (e.g. Paul) or Admin/Super Admin."""
+    if not is_direction_or_admin(current_user):
+        raise HTTPException(status_code=403, detail="Réservé à la Direction")
+    result = await db.formations.update_one(
+        {"id": formation_id, "statut": "En attente validation finale"},
+        {"$set": {
+            "statut": "Validée",
+            "validated_by": current_user['full_name'],
+            "validated_at": datetime.now(timezone.utc).isoformat()
+        }}
+    )
+    if result.modified_count == 0:
+        raise HTTPException(status_code=404, detail="Formation non trouvée ou déjà traitée")
+    await log_action(current_user['id'], current_user['full_name'], "Validation finale formation", f"Formation validée: {formation_id}")
+    formation = await db.formations.find_one({"id": formation_id}, {"_id": 0})
+    return FormationResponse(**formation)
+
+@api_router.put("/formations/{formation_id}/final-reject", response_model=FormationResponse)
+async def final_reject_formation(formation_id: str, data: FormationRejectReason, current_user: dict = Depends(get_current_user)):
+    if not is_direction_or_admin(current_user):
+        raise HTTPException(status_code=403, detail="Réservé à la Direction")
+    result = await db.formations.update_one(
+        {"id": formation_id, "statut": "En attente validation finale"},
+        {"$set": {
+            "statut": "Refusée",
+            "refused_stage": "direction",
+            "motif_refus": data.motif,
+            "validated_by": current_user['full_name'],
+            "validated_at": datetime.now(timezone.utc).isoformat()
+        }}
+    )
+    if result.modified_count == 0:
+        raise HTTPException(status_code=404, detail="Formation non trouvée ou déjà traitée")
+    await log_action(current_user['id'], current_user['full_name'], "Refus formation (Direction)", f"Formation refusée: {formation_id}")
+    formation = await db.formations.find_one({"id": formation_id}, {"_id": 0})
+    return FormationResponse(**formation)
 
 @api_router.put("/formations/{formation_id}/archive")
 async def archive_formation(formation_id: str, current_user: dict = Depends(get_current_user)):
@@ -1718,7 +1837,9 @@ async def get_dashboard_stats(current_user: dict = Depends(get_current_user)):
     total_materiel = await db.materiel.count_documents({"is_archived": False})
     materiel_disponible = await db.materiel.count_documents({"is_archived": False, "statut": "Disponible"})
     devis_en_attente = await db.devis.count_documents({"is_archived": False, "statut": "En attente"})
-    formations_en_attente = await db.formations.count_documents({"is_archived": False, "statut": "En attente"})
+    formations_en_attente_coordination = await db.formations.count_documents({"is_archived": False, "statut": "En attente Coordination"})
+    formations_en_attente_validation_finale = await db.formations.count_documents({"is_archived": False, "statut": "En attente validation finale"})
+    formations_en_attente = formations_en_attente_coordination + formations_en_attente_validation_finale
     
     # Stats Salles
     total_salles = await db.salles.count_documents({"is_archived": False})
@@ -1744,6 +1865,8 @@ async def get_dashboard_stats(current_user: dict = Depends(get_current_user)):
         "materiel_disponible": materiel_disponible,
         "devis_en_attente": devis_en_attente,
         "formations_en_attente": formations_en_attente,
+        "formations_en_attente_coordination": formations_en_attente_coordination,
+        "formations_en_attente_validation_finale": formations_en_attente_validation_finale,
         "branches_stats": branches_stats,
         "total_salles": total_salles,
         "reservations_en_attente": reservations_en_attente,
