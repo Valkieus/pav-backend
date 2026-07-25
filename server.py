@@ -299,6 +299,12 @@ class DocumentCreate(BaseModel):
     description: Optional[str] = None
     file_url: str
     file_type: str  # pdf, png, jpg, etc.
+    # Segmentation : quels niveaux d'accès peuvent voir ce document. Vide/absent
+    # = visible par tout le monde (comportement historique, rétrocompatible
+    # avec les documents existants qui n'ont pas ce champ). Une liste non vide
+    # restreint la visibilité à ces niveaux uniquement — typiquement pour
+    # exclure "Membre" des documents internes à la gestion.
+    visible_roles: Optional[List[str]] = None
 
 class DocumentResponse(BaseModel):
     id: str
@@ -311,6 +317,7 @@ class DocumentResponse(BaseModel):
     created_by: str
     created_by_name: str
     created_at: str
+    visible_roles: Optional[List[str]] = None
 
 class PlanningCreate(BaseModel):
     mois: int
@@ -2163,9 +2170,18 @@ async def get_documents(current_user: dict = Depends(get_current_user)):
     documents = await db.documents.find({}, {"_id": 0}).sort("created_at", -1).to_list(500)
     # Get category names
     categories = {c['id']: c['nom'] for c in await db.document_categories.find({}, {"_id": 0, "id": 1, "nom": 1}).to_list(100)}
+    user_role = current_user['niveau_acces']
+    visible_documents = []
     for doc in documents:
         doc['categorie_nom'] = categories.get(doc.get('categorie_id'), 'Sans catégorie')
-    return [DocumentResponse(**d) for d in documents]
+        visible_roles = doc.get('visible_roles') or []
+        # Liste vide/absente = document public (visible par tous). Liste non vide =
+        # restreint aux rôles listés ; Admin/Super Admin voient toujours tout, y
+        # compris pour gérer les documents restreints depuis l'UI.
+        if visible_roles and user_role not in visible_roles and user_role not in ("Super Admin", "Admin"):
+            continue
+        visible_documents.append(doc)
+    return [DocumentResponse(**d) for d in visible_documents]
 
 @api_router.post("/documents", response_model=DocumentResponse)
 async def create_document(data: DocumentCreate, current_user: dict = Depends(get_current_user)):
@@ -2173,7 +2189,7 @@ async def create_document(data: DocumentCreate, current_user: dict = Depends(get
     # Get category name
     category = await db.document_categories.find_one({"id": data.categorie_id}, {"_id": 0})
     categorie_nom = category['nom'] if category else 'Sans catégorie'
-    
+
     document = {
         "id": str(uuid.uuid4()),
         "titre": data.titre,
@@ -2182,6 +2198,7 @@ async def create_document(data: DocumentCreate, current_user: dict = Depends(get
         "description": data.description,
         "file_url": data.file_url,
         "file_type": data.file_type,
+        "visible_roles": data.visible_roles or [],
         "created_by": current_user['id'],
         "created_by_name": current_user['full_name'],
         "created_at": datetime.now(timezone.utc).isoformat()
@@ -2195,14 +2212,15 @@ async def update_document(document_id: str, data: DocumentCreate, current_user: 
     check_access(current_user, ["Super Admin", "Admin", "Responsable", "Gestionnaire"])
     category = await db.document_categories.find_one({"id": data.categorie_id}, {"_id": 0})
     categorie_nom = category['nom'] if category else 'Sans catégorie'
-    
+
     update_data = {
         "titre": data.titre,
         "categorie_id": data.categorie_id,
         "categorie_nom": categorie_nom,
         "description": data.description,
         "file_url": data.file_url,
-        "file_type": data.file_type
+        "file_type": data.file_type,
+        "visible_roles": data.visible_roles or []
     }
     result = await db.documents.update_one({"id": document_id}, {"$set": update_data})
     if result.modified_count == 0:
