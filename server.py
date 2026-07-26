@@ -328,6 +328,12 @@ class PlanningCreate(BaseModel):
     notes: Optional[dict] = None
     absences: Optional[dict] = None
     blocked_cells: Optional[dict] = None
+    # Titre/sous-titre personnalisés par jour, ex: {"dimanche": {"titre": "...", "sous_titre": "..."}}.
+    # Absent ou vide -> l'app retombe sur le titre calculé automatiquement (mois/année/jour).
+    titre_overrides: Optional[dict] = None
+    # Texte libre affiché sous une date précise (ex: nom d'invité, "Fête des
+    # pères"), ex: {"dimanche": {"2026-06-14": "Invité : Jonathan Stockstill"}}.
+    date_labels: Optional[dict] = None
 
 class PlanningResponse(BaseModel):
     id: str
@@ -339,6 +345,8 @@ class PlanningResponse(BaseModel):
     notes: Optional[dict] = None
     absences: Optional[dict] = None
     blocked_cells: Optional[dict] = None
+    titre_overrides: Optional[dict] = None
+    date_labels: Optional[dict] = None
     is_archived: bool
     created_at: str
     updated_at: str
@@ -1954,6 +1962,8 @@ async def create_planning(data: PlanningCreate, current_user: dict = Depends(get
         "notes": data.notes,
         "absences": data.absences,
         "blocked_cells": data.blocked_cells,
+        "titre_overrides": data.titre_overrides,
+        "date_labels": data.date_labels,
         "is_archived": False,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "updated_at": datetime.now(timezone.utc).isoformat()
@@ -1974,6 +1984,8 @@ async def update_planning(planning_id: str, data: PlanningCreate, current_user: 
         "notes": data.notes,
         "absences": data.absences,
         "blocked_cells": data.blocked_cells,
+        "titre_overrides": data.titre_overrides,
+        "date_labels": data.date_labels,
         "updated_at": datetime.now(timezone.utc).isoformat()
     }
     result = await db.planning.update_one({"id": planning_id}, {"$set": update_data})
