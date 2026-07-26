@@ -61,6 +61,25 @@ NIVEAUX_TECHNICIEN = ["Novice", "Débutant", "Intermédiaire", "Confirmé", "Exp
 NIVEAUX_ACCES = ["Membre", "Gestionnaire", "Responsable", "Admin", "Super Admin"]
 BRANCHES = ["Supervision", "Coordination", "Production", "Live", "Animation", "Régisseurs", "Diffusion"]
 SOUS_BRANCHES_LIVE = ["Incrustation", "Diffusion", "Cadreur", "Réalisation"]
+# Canonical postes used to filter the Planning assignment dropdown to only
+# the people actually qualified for a given role — independent of branche,
+# so exceptions (e.g. someone outside branche Live who can still fill in as
+# Réalisateur) are handled by simply ticking that poste on their fiche.
+POSTES = [
+    "Supervision Régie",
+    "Réalisateur",
+    "Assistant réalisateur / truquiste",
+    "Étalonneur",
+    "Opérateur VDO",
+    "Opérateur Incrustation",
+    "Animateur VDO / VFX",
+    "Intercom / Enregistrement FCP",
+    "Cadreur (Caméra)",
+    "Supervision Régisseurs",
+    "Régisseur",
+    "Supervision Diffusion",
+    "Diffusion (Salles)",
+]
 CATEGORIES_MATERIEL = ["Caméra", "Trépied", "Batterie", "Câble", "Câble HDMI", "Câble SDI", "Câble XLR", "Câble Ethernet", "Micro", "Son", "Lumière", "Moniteur", "Enregistreur", "Accessoire", "Autre"]
 STATUTS_DEVIS = ["En attente", "Validé", "Refusé", "Archivé"]
 STATUTS_FORMATION = ["En attente Coordination", "En attente validation finale", "Validée", "Refusée", "Archivée"]
@@ -144,6 +163,12 @@ class TechnicienCreate(BaseModel):
     badge_attribue: bool = False
     telephone: Optional[str] = None
     email: Optional[str] = None
+    # Poste(s) de prédilection — used to filter the Planning assignment
+    # dropdown to only relevant people. Independent of branches, so
+    # exceptions (someone doing a poste outside their usual branche) are
+    # just an extra tick here.
+    poste_principal: Optional[str] = None
+    postes_secondaires: Optional[List[str]] = []
 
 class TechnicienResponse(BaseModel):
     id: str
@@ -156,6 +181,8 @@ class TechnicienResponse(BaseModel):
     badge_attribue: bool
     telephone: Optional[str] = None
     email: Optional[str] = None
+    poste_principal: Optional[str] = None
+    postes_secondaires: Optional[List[str]] = []
     is_archived: bool
     created_at: str
     updated_at: str
@@ -2332,6 +2359,7 @@ async def get_enums():
         "niveaux_acces": NIVEAUX_ACCES,
         "branches": BRANCHES,
         "sous_branches_live": SOUS_BRANCHES_LIVE,
+        "postes": POSTES,
         "categories_materiel": CATEGORIES_MATERIEL,
         "statuts_devis": STATUTS_DEVIS,
         "statuts_formation": STATUTS_FORMATION,
