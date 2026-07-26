@@ -155,7 +155,7 @@ class TokenResponse(BaseModel):
 
 class TechnicienCreate(BaseModel):
     nom: str
-    prenom: str
+    prenom: Optional[str] = ""  # Kept for backward compatibility; the UI now uses a single "Nom" field
     niveau_technicien: str
     niveau_acces: str
     branches: List[str]  # Support multiple branches
@@ -2352,6 +2352,20 @@ async def get_logs(current_user: dict = Depends(get_current_user)):
 
 # ==================== ENUMS ENDPOINTS ====================
 
+async def get_postes_list() -> List[str]:
+    """Postes are editable at runtime (add/rename/delete) via /api/postes,
+    stored in a single settings doc, seeded from the POSTES constant the
+    first time it's read."""
+    doc = await db.settings.find_one({"_key": "postes"})
+    if not doc:
+        await db.settings.update_one(
+            {"_key": "postes"},
+            {"$set": {"_key": "postes", "list": POSTES}},
+            upsert=True
+        )
+        return list(POSTES)
+    return doc.get("list", POSTES)
+
 @api_router.get("/enums")
 async def get_enums():
     return {
@@ -2359,7 +2373,7 @@ async def get_enums():
         "niveaux_acces": NIVEAUX_ACCES,
         "branches": BRANCHES,
         "sous_branches_live": SOUS_BRANCHES_LIVE,
-        "postes": POSTES,
+        "postes": await get_postes_list(),
         "categories_materiel": CATEGORIES_MATERIEL,
         "statuts_devis": STATUTS_DEVIS,
         "statuts_formation": STATUTS_FORMATION,
@@ -2367,6 +2381,65 @@ async def get_enums():
         "statuts_reservation": STATUTS_RESERVATION,
         "permissions": PERMISSIONS
     }
+
+# ==================== POSTES MANAGEMENT (add/rename/delete) ====================
+
+class PosteCreate(BaseModel):
+    label: str
+
+class PosteRename(BaseModel):
+    new_label: str
+
+@api_router.post("/postes")
+async def add_poste(data: PosteCreate, current_user: dict = Depends(get_current_user)):
+    check_access(current_user, ["Super Admin", "Admin"])
+    label = data.label.strip()
+    if not label:
+        raise HTTPException(status_code=400, detail="Le nom du poste ne peut pas être vide")
+    current = await get_postes_list()
+    if label in current:
+        raise HTTPException(status_code=400, detail="Ce poste existe déjà")
+    current.append(label)
+    await db.settings.update_one({"_key": "postes"}, {"$set": {"list": current}}, upsert=True)
+    await log_action(current_user['id'], current_user['full_name'], "Ajout poste", f"Poste ajouté: {label}")
+    return {"status": "success", "postes": current}
+
+@api_router.put("/postes/{label}")
+async def rename_poste(label: str, data: PosteRename, current_user: dict = Depends(get_current_user)):
+    check_access(current_user, ["Super Admin", "Admin"])
+    new_label = data.new_label.strip()
+    if not new_label:
+        raise HTTPException(status_code=400, detail="Le nouveau nom ne peut pas être vide")
+    current = await get_postes_list()
+    if label not in current:
+        raise HTTPException(status_code=404, detail="Poste introuvable")
+    if new_label != label and new_label in current:
+        raise HTTPException(status_code=400, detail="Ce poste existe déjà")
+    current = [new_label if p == label else p for p in current]
+    await db.settings.update_one({"_key": "postes"}, {"$set": {"list": current}}, upsert=True)
+    # Propagate the rename to every technicien referencing the old label
+    await db.techniciens.update_many({"poste_principal": label}, {"$set": {"poste_principal": new_label}})
+    await db.techniciens.update_many(
+        {"postes_secondaires": label},
+        {"$set": {"postes_secondaires.$[elem]": new_label}},
+        array_filters=[{"elem": label}]
+    )
+    await log_action(current_user['id'], current_user['full_name'], "Renommage poste", f"Poste renommé: {label} -> {new_label}")
+    return {"status": "success", "postes": current}
+
+@api_router.delete("/postes/{label}")
+async def delete_poste(label: str, current_user: dict = Depends(get_current_user)):
+    check_access(current_user, ["Super Admin", "Admin"])
+    current = await get_postes_list()
+    if label not in current:
+        raise HTTPException(status_code=404, detail="Poste introuvable")
+    current = [p for p in current if p != label]
+    await db.settings.update_one({"_key": "postes"}, {"$set": {"list": current}}, upsert=True)
+    # Clean up references so no technicien fiche points to a deleted poste
+    await db.techniciens.update_many({"poste_principal": label}, {"$set": {"poste_principal": None}})
+    await db.techniciens.update_many({"postes_secondaires": label}, {"$pull": {"postes_secondaires": label}})
+    await log_action(current_user['id'], current_user['full_name'], "Suppression poste", f"Poste supprimé: {label}")
+    return {"status": "success", "postes": current}
 
 # ==================== SALLES ROUTES ====================
 
