@@ -1774,8 +1774,24 @@ async def confirm_badge(user_id: str, current_user: dict = Depends(get_current_u
         "badge_reviewed_by_name": current_user['full_name'],
         "badge_message": None,
     }})
-    if target.get('technicien_id'):
-        await db.techniciens.update_one({"id": target['technicien_id']}, {"$set": {"badge_attribue": True, "updated_at": now}})
+
+    # Reflect the validated badge in Effectif. Most accounts on this
+    # deployment aren't linked to a technicien_id (that link is only set by
+    # self-registration) — fall back to matching on name so the badge_attribue
+    # flag shown in Effectif still updates for admin-created accounts.
+    technicien_id = target.get('technicien_id')
+    if not technicien_id:
+        name = (target.get('full_name') or '').strip()
+        if name:
+            match = await db.techniciens.find_one(
+                {"nom": {"$regex": f"^{re.escape(name)}$", "$options": "i"}, "is_archived": False},
+                {"_id": 0, "id": 1}
+            )
+            if match:
+                technicien_id = match["id"]
+                await db.users.update_one({"id": user_id}, {"$set": {"technicien_id": technicien_id}})
+    if technicien_id:
+        await db.techniciens.update_one({"id": technicien_id}, {"$set": {"badge_attribue": True, "updated_at": now}})
     await log_action(current_user['id'], current_user['full_name'], "Validation badge", target.get('full_name'))
 
     await create_notification(
