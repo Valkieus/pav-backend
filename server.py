@@ -633,6 +633,83 @@ def is_direction_or_admin(user: dict) -> bool:
         return True
     return False
 
+# ==================== IN-APP NOTIFICATIONS ====================
+# Lightweight per-recipient notification docs (one doc per recipient, so
+# read/unread is trivially per-user) surfaced via a bell icon in the topbar.
+# Complements the existing email alerts — some events (RGPD deletion
+# requests, absence declarations) previously only reached people by email
+# with no in-app trace once the email was missed/archived.
+
+class NotificationResponse(BaseModel):
+    id: str
+    type: str
+    titre: str
+    message: str
+    link: Optional[str] = None
+    created_at: str
+    is_read: bool = False
+    read_at: Optional[str] = None
+
+async def get_user_ids_by_roles(roles: List[str]) -> List[str]:
+    users = await db.users.find({"niveau_acces": {"$in": roles}}, {"_id": 0, "id": 1}).to_list(1000)
+    return [u["id"] for u in users]
+
+async def get_coordination_user_ids() -> List[str]:
+    """Same population as is_coordination_or_admin: Admin/Super Admin plus
+    Gestionnaire/Responsable scoped to the Coordination branch."""
+    admins = await get_user_ids_by_roles(["Admin", "Super Admin"])
+    coord = await db.users.find(
+        {"niveau_acces": {"$in": ["Gestionnaire", "Responsable"]}, "branches": "Coordination"},
+        {"_id": 0, "id": 1}
+    ).to_list(1000)
+    return list(set(admins + [u["id"] for u in coord]))
+
+async def create_notification(recipient_ids: List[str], type_: str, titre: str, message: str, link: Optional[str] = None):
+    recipient_ids = [r for r in set(recipient_ids) if r]
+    if not recipient_ids:
+        return
+    now = datetime.now(timezone.utc).isoformat()
+    docs = [{
+        "id": str(uuid.uuid4()),
+        "recipient_id": rid,
+        "type": type_,
+        "titre": titre,
+        "message": message,
+        "link": link,
+        "created_at": now,
+        "is_read": False,
+        "read_at": None,
+    } for rid in recipient_ids]
+    await db.notifications.insert_many(docs)
+
+@api_router.get("/notifications", response_model=List[NotificationResponse])
+async def get_my_notifications(current_user: dict = Depends(get_current_user)):
+    notifs = await db.notifications.find({"recipient_id": current_user['id']}, {"_id": 0}).sort("created_at", -1).to_list(100)
+    return [NotificationResponse(**n) for n in notifs]
+
+@api_router.put("/notifications/{notification_id}/read")
+async def mark_notification_read(notification_id: str, current_user: dict = Depends(get_current_user)):
+    result = await db.notifications.update_one(
+        {"id": notification_id, "recipient_id": current_user['id']},
+        {"$set": {"is_read": True, "read_at": datetime.now(timezone.utc).isoformat()}}
+    )
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Notification non trouvée")
+    return {"message": "Notification marquée comme lue"}
+
+@api_router.put("/notifications/read-all")
+async def mark_all_notifications_read(current_user: dict = Depends(get_current_user)):
+    await db.notifications.update_many(
+        {"recipient_id": current_user['id'], "is_read": False},
+        {"$set": {"is_read": True, "read_at": datetime.now(timezone.utc).isoformat()}}
+    )
+    return {"message": "Toutes les notifications marquées comme lues"}
+
+@api_router.delete("/notifications/{notification_id}")
+async def delete_notification(notification_id: str, current_user: dict = Depends(get_current_user)):
+    await db.notifications.delete_one({"id": notification_id, "recipient_id": current_user['id']})
+    return {"message": "Notification supprimée"}
+
 # ==================== EMAIL NOTIFICATIONS ====================
 # Sent via the SendGrid HTTPS Email API (v3 /mail/send), not SMTP. Railway
 # blocks all outbound SMTP on Free/Trial/Hobby plans regardless of provider,
@@ -1228,6 +1305,13 @@ async def request_account_deletion(current_user: dict = Depends(get_current_user
          "À traiter sous 30 jours conformément au RGPD, depuis Administration → Utilisateurs."],
         kind="pending"
     ))
+    super_admin_ids = await get_user_ids_by_roles(["Super Admin"])
+    await create_notification(
+        super_admin_ids, "suppression_compte",
+        "Demande de suppression de compte",
+        f"{current_user['full_name']} ({current_user['username']}) demande la suppression de son compte (RGPD, à traiter sous 30 jours).",
+        link="/administration"
+    )
     return {"message": "Votre demande de suppression a été transmise à l'administration et sera traitée sous 30 jours."}
 
 @api_router.post("/auth/users", response_model=UserResponse)
@@ -1702,6 +1786,13 @@ async def create_devis(data: DevisCreate, current_user: dict = Depends(get_curre
         ["Bonjour,", f"<b>Titre :</b> {data.titre}", f"<b>Montant :</b> {data.montant} €", f"<b>Demandé par :</b> {current_user['full_name']}"],
         kind="pending"
     ))
+    coord_ids = await get_coordination_user_ids()
+    await create_notification(
+        coord_ids, "devis",
+        "Nouveau devis en attente",
+        f"{current_user['full_name']} a soumis un devis « {data.titre} » ({data.montant} €).",
+        link="/devis"
+    )
     return DevisResponse(**devis)
 
 @api_router.put("/devis/{devis_id}/validate")
@@ -2036,6 +2127,7 @@ async def create_formation_suggestion(data: FormationSuggestionCreate, current_u
     }
     await db.formation_suggestions.insert_one(suggestion)
     await log_action(current_user['id'], current_user['full_name'], "Suggestion formation", f"Suggestion: {data.titre}")
+    coord_ids = await get_coordination_user_ids()
     if data.formation_id:
         # Interest expressed in an existing catalogue formation — notify Gestionnaire+/Coordination.
         fire_and_forget_email(COORDINATION_NOTIFY_EMAIL, "Nouvel intérêt pour une formation", email_template(
@@ -2043,6 +2135,19 @@ async def create_formation_suggestion(data: FormationSuggestionCreate, current_u
             ["Bonjour,", f"<b>Formation :</b> {data.titre}", f"<b>Membre intéressé :</b> {current_user['full_name']}"],
             kind="pending"
         ))
+        await create_notification(
+            coord_ids, "formation_interet",
+            "Intérêt pour une formation",
+            f"{current_user['full_name']} est intéressé(e) par la formation « {data.titre} ».",
+            link="/formations"
+        )
+    else:
+        await create_notification(
+            coord_ids, "formation_suggestion",
+            "Nouvelle suggestion de formation",
+            f"{current_user['full_name']} propose un nouveau sujet de formation : « {data.titre} ».",
+            link="/formations"
+        )
     return FormationSuggestionResponse(**suggestion)
 
 @api_router.get("/formation-suggestions", response_model=List[FormationSuggestionResponse])
@@ -2294,6 +2399,13 @@ async def create_absence(data: AbsenceCreate, current_user: dict = Depends(get_c
     }
     await db.absences.insert_one(absence)
     await log_action(current_user['id'], current_user['full_name'], "Déclaration absence", f"{data.date_debut} → {data.date_fin}: {data.raison}")
+    gestion_ids = await get_user_ids_by_roles(["Super Admin", "Admin", "Responsable", "Gestionnaire"])
+    await create_notification(
+        gestion_ids, "absence",
+        "Nouvelle absence déclarée",
+        f"{current_user['full_name']} sera absent(e) du {data.date_debut} au {data.date_fin} ({data.raison}).",
+        link="/planning"
+    )
     return AbsenceResponse(**{k: v for k, v in absence.items() if k != "_id"})
 
 @api_router.get("/absences/mine", response_model=List[AbsenceResponse])
