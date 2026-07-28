@@ -85,6 +85,11 @@ STATUTS_DEVIS = ["En attente", "Validé", "Refusé", "Archivé"]
 STATUTS_FORMATION = ["En attente Coordination", "En attente validation finale", "Validée", "Refusée", "Archivée"]
 STATUTS_MATERIEL = ["Disponible", "En utilisation", "En maintenance", "Hors service", "Archivé"]
 STATUTS_RESERVATION = ["En attente", "Validée", "Refusée", "Annulée"]
+COMPETENCES_FORMATION = [
+    'Réalisation', 'Cadreur', 'Opérateur VDO', 'Opérateur Incrustation', 'Animateur VFX',
+    'Étalonneur', 'Assistant Réalisateur', 'Intercom / FCP', 'Supervision Régie', 'Régisseur',
+    'Animation', 'Post-Production', 'Logistique Technique', 'Son', 'Éclairage', 'Autre'
+]
 
 # Permissions list for groups
 PERMISSIONS = [
@@ -258,7 +263,7 @@ class DevisResponse(BaseModel):
 class FormationCreate(BaseModel):
     titre: str
     description: str
-    date_souhaitee: str
+    dates_souhaitees: List[str] = []  # multiple, non-contiguous days allowed
     duree: str
 
 class FormationCoordinationValidate(BaseModel):
@@ -274,7 +279,7 @@ class FormationResponse(BaseModel):
     id: str
     titre: str
     description: str
-    date_souhaitee: str
+    dates_souhaitees: List[str] = []
     duree: str
     formateur: Optional[str] = None
     cursus: Optional[str] = None
@@ -290,8 +295,10 @@ class FormationResponse(BaseModel):
     motif_refus: Optional[str] = None
     refused_stage: Optional[str] = None  # "coordination" | "direction"
     is_archived: bool
+    archived_at: Optional[str] = None
     disponible_catalogue: Optional[bool] = False
-    origine: Optional[str] = "demande_membre"  # "demande_membre" | "proposition_responsable"
+    origine: Optional[str] = "demande_membre"  # "demande_membre" | "proposition_responsable" | "suggestion_membre"
+    interested_members: List[str] = []
 
 class FormationCatalogueToggle(BaseModel):
     disponible_catalogue: bool
@@ -317,6 +324,7 @@ class FormationSuggestionResponse(BaseModel):
     created_by: str
     created_by_name: str
     created_at: str
+    resulting_formation_id: Optional[str] = None
 
 # Actualités models
 class ActualiteCreate(BaseModel):
@@ -1798,11 +1806,27 @@ async def delete_devis(devis_id: str, current_user: dict = Depends(get_current_u
 
 # ==================== FORMATIONS ROUTES ====================
 
+async def _formations_with_extras(query: dict) -> List[FormationResponse]:
+    """Attaches interested_members (names of anyone who suggested/expressed
+    interest in that formation, excluding rejected ones) to each formation."""
+    formations = await db.formations.find(query, {"_id": 0}).to_list(1000)
+    if not formations:
+        return []
+    ids = [f['id'] for f in formations]
+    suggestions = await db.formation_suggestions.find(
+        {"formation_id": {"$in": ids}, "statut": {"$ne": "Rejetée"}}, {"_id": 0}
+    ).to_list(2000)
+    interested_map = {}
+    for s in suggestions:
+        interested_map.setdefault(s['formation_id'], []).append(s['created_by_name'])
+    for f in formations:
+        f['interested_members'] = interested_map.get(f['id'], [])
+    return [FormationResponse(**f) for f in formations]
+
 @api_router.get("/formations", response_model=List[FormationResponse])
 async def get_formations(include_archived: bool = False, current_user: dict = Depends(get_current_user)):
     query = {} if include_archived else {"is_archived": False}
-    formations = await db.formations.find(query, {"_id": 0}).to_list(1000)
-    return [FormationResponse(**f) for f in formations]
+    return await _formations_with_extras(query)
 
 @api_router.post("/formations", response_model=FormationResponse)
 async def create_formation(data: FormationCreate, current_user: dict = Depends(get_current_user)):
@@ -1823,16 +1847,19 @@ async def create_formation(data: FormationCreate, current_user: dict = Depends(g
         "motif_refus": None,
         "refused_stage": None,
         "is_archived": False,
+        "archived_at": None,
         "disponible_catalogue": False,
         "origine": "demande_membre" if current_user['niveau_acces'] == 'Membre' else "proposition_responsable"
     }
     await db.formations.insert_one(formation)
     await log_action(current_user['id'], current_user['full_name'], "Demande formation", f"Formation demandée: {data.titre}")
+    dates_str = ", ".join(data.dates_souhaitees) if data.dates_souhaitees else "À définir"
     fire_and_forget_email(COORDINATION_NOTIFY_EMAIL, "Nouvelle demande de formation", email_template(
         "Une nouvelle demande de formation attend la Coordination",
-        ["Bonjour,", f"<b>Titre :</b> {data.titre}", f"<b>Demandé par :</b> {current_user['full_name']}", f"<b>Date souhaitée :</b> {data.date_souhaitee}"],
+        ["Bonjour,", f"<b>Titre :</b> {data.titre}", f"<b>Demandé par :</b> {current_user['full_name']}", f"<b>Date(s) souhaitée(s) :</b> {dates_str}"],
         kind="pending"
     ))
+    formation['interested_members'] = []
     return FormationResponse(**formation)
 
 @api_router.put("/formations/{formation_id}", response_model=FormationResponse)
@@ -1845,13 +1872,14 @@ async def update_formation(formation_id: str, data: FormationCreate, current_use
     update_data = {
         "titre": data.titre,
         "description": data.description,
-        "date_souhaitee": data.date_souhaitee,
+        "dates_souhaitees": data.dates_souhaitees,
         "duree": data.duree,
         "updated_at": datetime.now(timezone.utc).isoformat()
     }
     await db.formations.update_one({"id": formation_id}, {"$set": update_data})
     await log_action(current_user['id'], current_user['full_name'], "Modification formation", f"Formation modifiée: {data.titre}")
     formation = await db.formations.find_one({"id": formation_id}, {"_id": 0})
+    formation['interested_members'] = []
     return FormationResponse(**formation)
 
 @api_router.put("/formations/{formation_id}/coordination-validate", response_model=FormationResponse)
@@ -1935,7 +1963,7 @@ async def final_validate_formation(formation_id: str, current_user: dict = Depen
     formation = await db.formations.find_one({"id": formation_id}, {"_id": 0})
     fire_and_forget_email(await get_user_email(formation['created_by']), "Formation validée", email_template(
         "Votre demande de formation a été validée",
-        [f"Bonjour {formation.get('created_by_name', '')},", f"<b>Titre :</b> {formation['titre']}", f"<b>Date souhaitée :</b> {formation.get('date_souhaitee') or '-'}"],
+        [f"Bonjour {formation.get('created_by_name', '')},", f"<b>Titre :</b> {formation['titre']}", f"<b>Date(s) souhaitée(s) :</b> {', '.join(formation.get('dates_souhaitees') or []) or '-'}"],
         kind="success"
     ))
     return FormationResponse(**formation)
@@ -2000,9 +2028,17 @@ async def create_formation_suggestion(data: FormationSuggestionCreate, current_u
         "created_by": current_user['id'],
         "created_by_name": current_user['full_name'],
         "created_at": datetime.now(timezone.utc).isoformat(),
+        "resulting_formation_id": None,
     }
     await db.formation_suggestions.insert_one(suggestion)
     await log_action(current_user['id'], current_user['full_name'], "Suggestion formation", f"Suggestion: {data.titre}")
+    if data.formation_id:
+        # Interest expressed in an existing catalogue formation — notify Gestionnaire+/Coordination.
+        fire_and_forget_email(COORDINATION_NOTIFY_EMAIL, "Nouvel intérêt pour une formation", email_template(
+            "Un membre a manifesté son intérêt pour une formation du catalogue",
+            ["Bonjour,", f"<b>Formation :</b> {data.titre}", f"<b>Membre intéressé :</b> {current_user['full_name']}"],
+            kind="pending"
+        ))
     return FormationSuggestionResponse(**suggestion)
 
 @api_router.get("/formation-suggestions", response_model=List[FormationSuggestionResponse])
@@ -2016,10 +2052,71 @@ async def get_my_formation_suggestions(current_user: dict = Depends(get_current_
     suggestions = await db.formation_suggestions.find({"created_by": current_user['id']}, {"_id": 0}).sort("created_at", -1).to_list(1000)
     return [FormationSuggestionResponse(**s) for s in suggestions]
 
+@api_router.delete("/formation-suggestions/{suggestion_id}")
+async def withdraw_formation_suggestion(suggestion_id: str, current_user: dict = Depends(get_current_user)):
+    """A member can withdraw their own suggestion or expressed interest.
+    If it's tied to a scheduled formation, withdrawal is blocked within 72h
+    of the earliest requested date."""
+    suggestion = await db.formation_suggestions.find_one({"id": suggestion_id}, {"_id": 0})
+    if not suggestion:
+        raise HTTPException(status_code=404, detail="Suggestion non trouvée")
+    if suggestion['created_by'] != current_user['id'] and not is_coordination_or_admin(current_user):
+        raise HTTPException(status_code=403, detail="Non autorisé")
+    if suggestion.get('formation_id'):
+        formation = await db.formations.find_one({"id": suggestion['formation_id']}, {"_id": 0})
+        dates = (formation or {}).get('dates_souhaitees') or []
+        if dates:
+            try:
+                earliest = min(datetime.fromisoformat(d).replace(tzinfo=timezone.utc) for d in dates)
+                deadline = earliest - timedelta(hours=72)
+                if datetime.now(timezone.utc) > deadline:
+                    raise HTTPException(status_code=400, detail="Trop tard pour se retirer (moins de 72h avant la formation)")
+            except ValueError:
+                pass  # malformed date, don't block withdrawal over it
+    await db.formation_suggestions.delete_one({"id": suggestion_id})
+    await log_action(current_user['id'], current_user['full_name'], "Retrait suggestion formation", f"Suggestion retirée: {suggestion.get('titre')}")
+    return {"message": "Retrait effectué"}
+
 @api_router.put("/formation-suggestions/{suggestion_id}/status", response_model=FormationSuggestionResponse)
 async def update_formation_suggestion_status(suggestion_id: str, data: FormationSuggestionStatusUpdate, current_user: dict = Depends(get_current_user)):
     check_access(current_user, ["Super Admin", "Admin", "Responsable", "Gestionnaire"])
-    result = await db.formation_suggestions.update_one({"id": suggestion_id}, {"$set": {"statut": data.statut}})
+    suggestion = await db.formation_suggestions.find_one({"id": suggestion_id}, {"_id": 0})
+    if not suggestion:
+        raise HTTPException(status_code=404, detail="Suggestion non trouvée")
+    update_fields = {"statut": data.statut}
+    # Approving a brand-new topic suggestion (no formation_id yet, i.e. not
+    # "interest in an existing catalogue item") turns it into a real formation
+    # request so it actually enters the Coordination -> Direction pipeline
+    # instead of just sitting there approved with nothing happening.
+    if data.statut == "Approuvée" and not suggestion.get('formation_id') and not suggestion.get('resulting_formation_id'):
+        new_formation = {
+            "id": str(uuid.uuid4()),
+            "titre": suggestion['titre'],
+            "description": suggestion.get('description') or '',
+            "dates_souhaitees": [],
+            "duree": "À définir",
+            "formateur": None,
+            "cursus": None,
+            "lieu": None,
+            "statut": "En attente Coordination",
+            "created_by": suggestion['created_by'],
+            "created_by_name": suggestion['created_by_name'],
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "coordination_by": None,
+            "coordination_at": None,
+            "validated_by": None,
+            "validated_at": None,
+            "motif_refus": None,
+            "refused_stage": None,
+            "is_archived": False,
+            "archived_at": None,
+            "disponible_catalogue": False,
+            "origine": "suggestion_membre"
+        }
+        await db.formations.insert_one(new_formation)
+        update_fields["resulting_formation_id"] = new_formation["id"]
+        await log_action(current_user['id'], current_user['full_name'], "Suggestion → formation", f"Suggestion transformée en demande: {suggestion['titre']}")
+    result = await db.formation_suggestions.update_one({"id": suggestion_id}, {"$set": update_fields})
     if result.matched_count == 0:
         raise HTTPException(status_code=404, detail="Suggestion non trouvée")
     await log_action(current_user['id'], current_user['full_name'], "Suggestion formation", f"Statut mis à jour: {data.statut}")
@@ -2029,11 +2126,25 @@ async def update_formation_suggestion_status(suggestion_id: str, data: Formation
 @api_router.put("/formations/{formation_id}/archive")
 async def archive_formation(formation_id: str, current_user: dict = Depends(get_current_user)):
     check_access(current_user, ["Super Admin", "Admin"])
-    result = await db.formations.update_one({"id": formation_id}, {"$set": {"is_archived": True}})
+    result = await db.formations.update_one(
+        {"id": formation_id},
+        {"$set": {"is_archived": True, "archived_at": datetime.now(timezone.utc).isoformat()}}
+    )
     if result.modified_count == 0:
         raise HTTPException(status_code=404, detail="Formation non trouvée")
     await log_action(current_user['id'], current_user['full_name'], "Archivage formation", f"Formation archivée: {formation_id}")
     return {"message": "Formation archivée"}
+
+async def purge_old_archived_formations():
+    """Archived formations are kept 6 months for reference, then purged.
+    Runs once at startup and then every 24h in the background."""
+    while True:
+        try:
+            cutoff = (datetime.now(timezone.utc) - timedelta(days=180)).isoformat()
+            await db.formations.delete_many({"is_archived": True, "archived_at": {"$lt": cutoff}})
+        except Exception as e:
+            logger.error(f"Purge formations archivées échouée: {e}")
+        await asyncio.sleep(24 * 60 * 60)
 
 @api_router.delete("/formations/{formation_id}")
 async def delete_formation(formation_id: str, current_user: dict = Depends(get_current_user)):
@@ -2456,6 +2567,19 @@ async def get_postes_list() -> List[str]:
         return list(POSTES)
     return doc.get("list", POSTES)
 
+async def get_competences_formation_list() -> List[str]:
+    """Same editable-at-runtime pattern as postes, for the 'compétence
+    souhaitée' list used when requesting/proposing a formation."""
+    doc = await db.settings.find_one({"_key": "competences_formation"})
+    if not doc:
+        await db.settings.update_one(
+            {"_key": "competences_formation"},
+            {"$set": {"_key": "competences_formation", "list": COMPETENCES_FORMATION}},
+            upsert=True
+        )
+        return list(COMPETENCES_FORMATION)
+    return doc.get("list", COMPETENCES_FORMATION)
+
 @api_router.get("/enums")
 async def get_enums():
     return {
@@ -2469,8 +2593,58 @@ async def get_enums():
         "statuts_formation": STATUTS_FORMATION,
         "statuts_materiel": STATUTS_MATERIEL,
         "statuts_reservation": STATUTS_RESERVATION,
+        "competences_formation": await get_competences_formation_list(),
         "permissions": PERMISSIONS
     }
+
+# ==================== COMPETENCES FORMATION MANAGEMENT (add/rename/delete) ====================
+
+class CompetenceCreate(BaseModel):
+    label: str
+
+class CompetenceRename(BaseModel):
+    new_label: str
+
+@api_router.post("/competences-formation")
+async def add_competence_formation(data: CompetenceCreate, current_user: dict = Depends(get_current_user)):
+    check_access(current_user, ["Super Admin", "Admin"])
+    label = data.label.strip()
+    if not label:
+        raise HTTPException(status_code=400, detail="Le nom de la compétence ne peut pas être vide")
+    current = await get_competences_formation_list()
+    if label in current:
+        raise HTTPException(status_code=400, detail="Cette compétence existe déjà")
+    current.append(label)
+    await db.settings.update_one({"_key": "competences_formation"}, {"$set": {"list": current}}, upsert=True)
+    await log_action(current_user['id'], current_user['full_name'], "Ajout compétence formation", f"Compétence ajoutée: {label}")
+    return {"status": "success", "competences_formation": current}
+
+@api_router.put("/competences-formation/{label}")
+async def rename_competence_formation(label: str, data: CompetenceRename, current_user: dict = Depends(get_current_user)):
+    check_access(current_user, ["Super Admin", "Admin"])
+    new_label = data.new_label.strip()
+    if not new_label:
+        raise HTTPException(status_code=400, detail="Le nouveau nom ne peut pas être vide")
+    current = await get_competences_formation_list()
+    if label not in current:
+        raise HTTPException(status_code=404, detail="Compétence introuvable")
+    if new_label != label and new_label in current:
+        raise HTTPException(status_code=400, detail="Cette compétence existe déjà")
+    current = [new_label if c == label else c for c in current]
+    await db.settings.update_one({"_key": "competences_formation"}, {"$set": {"list": current}}, upsert=True)
+    await log_action(current_user['id'], current_user['full_name'], "Renommage compétence formation", f"Compétence renommée: {label} -> {new_label}")
+    return {"status": "success", "competences_formation": current}
+
+@api_router.delete("/competences-formation/{label}")
+async def delete_competence_formation(label: str, current_user: dict = Depends(get_current_user)):
+    check_access(current_user, ["Super Admin", "Admin"])
+    current = await get_competences_formation_list()
+    if label not in current:
+        raise HTTPException(status_code=404, detail="Compétence introuvable")
+    current = [c for c in current if c != label]
+    await db.settings.update_one({"_key": "competences_formation"}, {"$set": {"list": current}}, upsert=True)
+    await log_action(current_user['id'], current_user['full_name'], "Suppression compétence formation", f"Compétence supprimée: {label}")
+    return {"status": "success", "competences_formation": current}
 
 # ==================== POSTES MANAGEMENT (add/rename/delete) ====================
 
@@ -3197,6 +3371,7 @@ async def update_maintenance_mode(data: MaintenanceModeUpdate, current_user: dic
 @app.on_event("startup")
 async def startup():
     await seed_data()
+    asyncio.create_task(purge_old_archived_formations())
     # Create indexes for better query performance
     try:
         await db.planning.create_index([("annee", 1), ("mois", 1)], unique=True)
