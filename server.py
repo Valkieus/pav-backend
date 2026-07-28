@@ -205,6 +205,15 @@ class TechnicienResponse(BaseModel):
     is_archived: bool
     created_at: str
     updated_at: str
+    # Fiches créées par un Responsable passent par une validation Coordination
+    # avant d'intégrer définitivement l'effectif (workflow de soumission).
+    is_pending_approval: Optional[bool] = False
+    proposed_by: Optional[str] = None
+    proposed_by_name: Optional[str] = None
+    rejection_reason: Optional[str] = None
+
+class TechnicienRejectRequest(BaseModel):
+    message: Optional[str] = None
 
 class BadgeRejectRequest(BaseModel):
     message: str
@@ -585,12 +594,23 @@ class GroupCreateEnhanced(BaseModel):
     name: str
     description: Optional[str] = None
     permissions: List[str]
+    # Planning access scoping. Only meaningful for the "Responsable" role —
+    # Gestionnaire+ already get unrestricted planning.write via the role
+    # hierarchy in check_access_or_permission. planning_full_control=True
+    # grants a Responsable the same unrestricted grid access as Gestionnaire+.
+    # planning_scope is a list of Planning section names (e.g. "CADREURS",
+    # "REGIE", "DIFFUSION", "REGISSEURS") and/or role-key substrings (e.g.
+    # "incrustation", "animateur_vfx") a scoped Responsable may fill in.
+    planning_full_control: bool = False
+    planning_scope: List[str] = []
 
 class GroupResponseEnhanced(BaseModel):
     id: str
     name: str
     description: Optional[str] = None
     permissions: List[str]
+    planning_full_control: bool = False
+    planning_scope: List[str] = []
     members_count: int
     created_at: str
     updated_at: str
@@ -642,6 +662,47 @@ async def get_user_group_permissions(user: dict) -> set:
     for g in groups:
         perms.update(g.get('permissions') or [])
     return perms
+
+async def get_user_planning_scope(user: dict):
+    """Planning scoping derived from group membership — only meaningful for
+    the Responsable role (Gestionnaire+ already bypass restriction via role).
+    Returns (full_control: bool, scope: set[str]) where scope entries are
+    either Planning section names ("CADREURS", "REGIE", ...) or role-key
+    substrings ("incrustation", "animateur_vfx", ...)."""
+    group_ids = user.get('group_ids') or []
+    if not group_ids:
+        return False, set()
+    groups = await db.groups.find({"id": {"$in": group_ids}}, {"_id": 0}).to_list(100)
+    full_control = any(g.get('planning_full_control') for g in groups)
+    scope: set = set()
+    for g in groups:
+        scope.update(g.get('planning_scope') or [])
+    return full_control, scope
+
+def build_role_section_map(sections_dict: dict) -> dict:
+    """Flatten a Planning `sections` document into
+    {affectation_key: section_name}, where affectation_key mirrors the
+    frontend's `${role.key}_${slotIdx}` convention. Used to check which
+    section a given affectation edit belongs to."""
+    mapping: dict = {}
+    if not isinstance(sections_dict, dict):
+        return mapping
+    for _day, tables in sections_dict.items():
+        if not isinstance(tables, dict):
+            continue
+        for _table_key, secs in tables.items():
+            if not isinstance(secs, list):
+                continue
+            for section in secs:
+                name = section.get('name', '') if isinstance(section, dict) else ''
+                for role in (section.get('roles', []) if isinstance(section, dict) else []):
+                    role_key = role.get('key') if isinstance(role, dict) else None
+                    slots = role.get('slots', 1) if isinstance(role, dict) else 1
+                    if not role_key:
+                        continue
+                    for slot_idx in range(slots):
+                        mapping[f"{role_key}_{slot_idx}"] = name
+    return mapping
 
 async def check_access_or_permission(user: dict, required_levels: List[str], permission: str):
     """Same baseline as check_access (role hierarchy), OR'd with an explicit
@@ -1607,8 +1668,20 @@ def normalize_technicien(t: dict) -> dict:
 @api_router.get("/techniciens", response_model=List[TechnicienResponse])
 async def get_techniciens(include_archived: bool = False, current_user: dict = Depends(get_current_user)):
     query = {} if include_archived else {"is_archived": False}
+    # Les fiches proposées par un Responsable et pas encore validées par la
+    # Coordination n'apparaissent pas dans l'effectif "officiel" — elles ne
+    # sont visibles que via /techniciens/pending.
+    query["is_pending_approval"] = {"$ne": True}
     techniciens = await db.techniciens.find(query, {"_id": 0}).sort("nom", 1).to_list(1000)
     return [TechnicienResponse(**normalize_technicien(t)) for t in techniciens]
+
+@api_router.get("/techniciens/pending", response_model=List[TechnicienResponse])
+async def get_pending_techniciens(current_user: dict = Depends(get_current_user)):
+    # Coordination = Gestionnaire+ (le rôle Responsable qui soumet la fiche
+    # ne doit pas pouvoir se valider lui-même).
+    await check_access_or_permission(current_user, ["Super Admin", "Gestionnaire"], "effectif.write")
+    techs = await db.techniciens.find({"is_pending_approval": True}, {"_id": 0}).sort("created_at", -1).to_list(500)
+    return [TechnicienResponse(**normalize_technicien(t)) for t in techs]
 
 @api_router.get("/techniciens/{tech_id}", response_model=TechnicienResponse)
 async def get_technicien(tech_id: str, current_user: dict = Depends(get_current_user)):
@@ -1620,16 +1693,68 @@ async def get_technicien(tech_id: str, current_user: dict = Depends(get_current_
 @api_router.post("/techniciens", response_model=TechnicienResponse)
 async def create_technicien(data: TechnicienCreate, current_user: dict = Depends(get_current_user)):
     await check_access_or_permission(current_user, ["Super Admin", "Responsable"], "effectif.write")
+    # Une fiche créée par un Responsable est soumise à la Coordination avant
+    # d'intégrer définitivement l'effectif. Super Admin (et quiconque passe
+    # via un droit de groupe explicite) reste en création directe.
+    is_responsable_submission = current_user['niveau_acces'] == "Responsable"
     tech = {
         "id": str(uuid.uuid4()),
         **data.model_dump(),
         "is_archived": False,
+        "is_pending_approval": is_responsable_submission,
+        "proposed_by": current_user['id'] if is_responsable_submission else None,
+        "proposed_by_name": current_user['full_name'] if is_responsable_submission else None,
+        "rejection_reason": None,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "updated_at": datetime.now(timezone.utc).isoformat()
     }
     await db.techniciens.insert_one(tech)
-    await log_action(current_user['id'], current_user['full_name'], "Création technicien", f"Technicien créé: {data.nom} {data.prenom}")
+    if is_responsable_submission:
+        await log_action(current_user['id'], current_user['full_name'], "Proposition fiche technicien", f"Fiche proposée (en attente de validation): {data.nom} {data.prenom}")
+        coord_ids = await get_coordination_user_ids()
+        await create_notification(
+            coord_ids, "technicien", "Nouvelle fiche à valider",
+            f"{current_user['full_name']} propose l'ajout de {data.nom} à l'effectif.",
+            link="/effectif"
+        )
+    else:
+        await log_action(current_user['id'], current_user['full_name'], "Création technicien", f"Technicien créé: {data.nom} {data.prenom}")
     return TechnicienResponse(**tech)
+
+@api_router.post("/techniciens/{tech_id}/approve", response_model=TechnicienResponse)
+async def approve_technicien(tech_id: str, current_user: dict = Depends(get_current_user)):
+    await check_access_or_permission(current_user, ["Super Admin", "Gestionnaire"], "effectif.write")
+    tech = await db.techniciens.find_one({"id": tech_id}, {"_id": 0})
+    if not tech:
+        raise HTTPException(status_code=404, detail="Technicien introuvable")
+    now = datetime.now(timezone.utc).isoformat()
+    await db.techniciens.update_one({"id": tech_id}, {"$set": {
+        "is_pending_approval": False, "rejection_reason": None, "updated_at": now
+    }})
+    await log_action(current_user['id'], current_user['full_name'], "Validation fiche technicien", f"Fiche validée: {tech['nom']}")
+    if tech.get('proposed_by'):
+        await create_notification(
+            [tech['proposed_by']], "technicien", "Fiche validée",
+            f"La fiche de {tech['nom']} a été validée et ajoutée à l'effectif.",
+            link="/effectif"
+        )
+    updated = await db.techniciens.find_one({"id": tech_id}, {"_id": 0})
+    return TechnicienResponse(**normalize_technicien(updated))
+
+@api_router.post("/techniciens/{tech_id}/reject")
+async def reject_technicien(tech_id: str, data: TechnicienRejectRequest, current_user: dict = Depends(get_current_user)):
+    await check_access_or_permission(current_user, ["Super Admin", "Gestionnaire"], "effectif.write")
+    tech = await db.techniciens.find_one({"id": tech_id}, {"_id": 0})
+    if not tech:
+        raise HTTPException(status_code=404, detail="Technicien introuvable")
+    await db.techniciens.delete_one({"id": tech_id})
+    await log_action(current_user['id'], current_user['full_name'], "Rejet fiche technicien", f"Fiche rejetée: {tech['nom']}" + (f" — {data.message}" if data.message else ""))
+    if tech.get('proposed_by'):
+        msg = f"La fiche de {tech['nom']} n'a pas été retenue."
+        if data.message:
+            msg += f" Motif : {data.message}"
+        await create_notification([tech['proposed_by']], "technicien", "Fiche non retenue", msg, link="/effectif")
+    return {"message": "Fiche rejetée"}
 
 @api_router.put("/techniciens/{tech_id}", response_model=TechnicienResponse)
 async def update_technicien(tech_id: str, data: TechnicienCreate, current_user: dict = Depends(get_current_user)):
@@ -2544,12 +2669,31 @@ async def get_planning_by_month(annee: int, mois: int, current_user: dict = Depe
         raise HTTPException(status_code=404, detail="Planning non trouvé")
     return PlanningResponse(**planning)
 
+class PlanningScopeResponse(BaseModel):
+    is_restricted: bool  # True only for a Responsable without planning_full_control
+    full_control: bool
+    scope: List[str]
+
+@api_router.get("/me/planning-scope", response_model=PlanningScopeResponse)
+async def get_my_planning_scope(current_user: dict = Depends(get_current_user)):
+    """Drives frontend cell-level gating in Planning.js. Only the Responsable
+    role can be restricted — every other role that reaches the Planning
+    write UI already has unrestricted access via the role hierarchy."""
+    if current_user['niveau_acces'] != 'Responsable':
+        return PlanningScopeResponse(is_restricted=False, full_control=True, scope=[])
+    full_control, scope = await get_user_planning_scope(current_user)
+    return PlanningScopeResponse(is_restricted=not full_control, full_control=full_control, scope=sorted(scope))
+
 @api_router.post("/planning", response_model=PlanningResponse)
 async def create_planning(data: PlanningCreate, current_user: dict = Depends(get_current_user)):
     # Gestionnaire is included so they can save the Absences/Notes fields they're
     # allowed to edit in the web Planning; the UI itself keeps the affectation
     # grid cells read-only for anyone below Responsable.
     await check_access_or_permission(current_user, ["Super Admin", "Responsable", "Gestionnaire"], "planning.write")
+    if current_user['niveau_acces'] == 'Responsable':
+        full_control, _scope = await get_user_planning_scope(current_user)
+        if not full_control:
+            raise HTTPException(status_code=403, detail="Seuls les groupes à contrôle total peuvent créer un nouveau planning")
     existing = await db.planning.find_one({"annee": data.annee, "mois": data.mois, "is_archived": False})
     if existing:
         raise HTTPException(status_code=400, detail="Un planning existe déjà pour ce mois")
@@ -2579,6 +2723,29 @@ async def update_planning(planning_id: str, data: PlanningCreate, current_user: 
     # Same rationale as create_planning above: Gestionnaire needs to be able
     # to save after editing Absences/Notes.
     await check_access_or_permission(current_user, ["Super Admin", "Responsable", "Gestionnaire"], "planning.write")
+    if current_user['niveau_acces'] == 'Responsable':
+        full_control, scope = await get_user_planning_scope(current_user)
+        if not full_control:
+            existing_check = await db.planning.find_one({"id": planning_id}, {"_id": 0})
+            if not existing_check:
+                raise HTTPException(status_code=404, detail="Planning non trouvé")
+            # A scoped Responsable may only fill in affectation values within
+            # their group's sections/postes — structural edits (categories,
+            # dates, blocked cells, custom titles/labels) require full control.
+            structural_fields = ["sections", "dates", "blocked_cells", "titre_overrides", "date_labels"]
+            for field in structural_fields:
+                if getattr(data, field) != existing_check.get(field):
+                    raise HTTPException(status_code=403, detail="Votre groupe ne permet pas de modifier la structure du planning (catégories, dates, libellés) — seulement les affectations de votre périmètre")
+            role_section = build_role_section_map(existing_check.get('sections') or {})
+            old_aff = existing_check.get('affectations') or {}
+            new_aff = data.affectations or {}
+            for key in set(list(old_aff.keys()) + list(new_aff.keys())):
+                if old_aff.get(key) == new_aff.get(key):
+                    continue
+                section_name = role_section.get(key, '')
+                allowed = (section_name and section_name in scope) or any(p and p in key for p in scope)
+                if not allowed:
+                    raise HTTPException(status_code=403, detail=f"Vous n'avez pas les droits sur « {section_name or key} »")
     update_data = {
         "dates": data.dates,
         "affectations": data.affectations,
@@ -3935,6 +4102,8 @@ async def get_groups_enhanced(current_user: dict = Depends(get_current_user)):
             name=g['name'],
             description=g.get('description'),
             permissions=g.get('permissions', []),
+            planning_full_control=g.get('planning_full_control', False),
+            planning_scope=g.get('planning_scope', []),
             members_count=members_count,
             created_at=g['created_at'],
             updated_at=g.get('updated_at', g['created_at'])
@@ -3949,6 +4118,8 @@ async def create_group_enhanced(data: GroupCreateEnhanced, current_user: dict = 
         "name": data.name,
         "description": data.description,
         "permissions": data.permissions,
+        "planning_full_control": data.planning_full_control,
+        "planning_scope": data.planning_scope,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "updated_at": datetime.now(timezone.utc).isoformat()
     }
@@ -3963,6 +4134,8 @@ async def update_group_enhanced(group_id: str, data: GroupCreateEnhanced, curren
         "name": data.name,
         "description": data.description,
         "permissions": data.permissions,
+        "planning_full_control": data.planning_full_control,
+        "planning_scope": data.planning_scope,
         "updated_at": datetime.now(timezone.utc).isoformat()
     }
     result = await db.groups.update_one({"id": group_id}, {"$set": update_data})
