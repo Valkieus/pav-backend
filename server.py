@@ -165,7 +165,7 @@ class TokenResponse(BaseModel):
 class TechnicienCreate(BaseModel):
     nom: str
     prenom: Optional[str] = ""  # Kept for backward compatibility; the UI now uses a single "Nom" field
-    niveau_technicien: str
+    niveau_technicien: Optional[str] = None  # Not mandatory — some techniciens don't have a level assigned yet
     niveau_acces: str
     branches: List[str]  # Support multiple branches
     sous_branches: Optional[List[str]] = []  # Support multiple sous-branches (Live only)
@@ -183,7 +183,7 @@ class TechnicienResponse(BaseModel):
     id: str
     nom: str
     prenom: str
-    niveau_technicien: str
+    niveau_technicien: Optional[str] = None
     niveau_acces: str
     branches: List[str]  # Support multiple branches
     sous_branches: Optional[List[str]] = []
