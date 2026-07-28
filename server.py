@@ -618,6 +618,30 @@ def check_access(user: dict, required_levels: List[str]):
     if user['niveau_acces'] not in required_levels:
         raise HTTPException(status_code=403, detail="Accès non autorisé")
 
+async def get_user_group_permissions(user: dict) -> set:
+    """Union of permissions granted via every Groupe (Administration > Groupes
+    & Droits) this user belongs to. Empty set if they're in no group."""
+    group_ids = user.get('group_ids') or []
+    if not group_ids:
+        return set()
+    groups = await db.groups.find({"id": {"$in": group_ids}}, {"_id": 0, "permissions": 1}).to_list(100)
+    perms: set = set()
+    for g in groups:
+        perms.update(g.get('permissions') or [])
+    return perms
+
+async def check_access_or_permission(user: dict, required_levels: List[str], permission: str):
+    """Same baseline as check_access (role hierarchy), OR'd with an explicit
+    permission grant from a Groupe. This is what makes assigning a group's
+    permissions to a user in Administration > Groupes actually do something,
+    instead of the permission checkboxes being purely decorative."""
+    if user['niveau_acces'] in required_levels or user['niveau_acces'] in ("Super Admin", "Admin"):
+        return
+    perms = await get_user_group_permissions(user)
+    if permission in perms:
+        return
+    raise HTTPException(status_code=403, detail="Accès non autorisé")
+
 def is_coordination_or_admin(user: dict) -> bool:
     """Coordination step of the Formations workflow: Gestionnaire+ in the
     Coordination branch, or Admin/Super Admin (who retain full visibility)."""
@@ -1568,7 +1592,7 @@ async def get_techniciens(include_archived: bool = False, current_user: dict = D
 
 @api_router.post("/techniciens", response_model=TechnicienResponse)
 async def create_technicien(data: TechnicienCreate, current_user: dict = Depends(get_current_user)):
-    check_access(current_user, ["Super Admin", "Admin", "Responsable"])
+    await check_access_or_permission(current_user, ["Super Admin", "Admin", "Responsable"], "effectif.write")
     tech = {
         "id": str(uuid.uuid4()),
         **data.model_dump(),
@@ -1582,7 +1606,7 @@ async def create_technicien(data: TechnicienCreate, current_user: dict = Depends
 
 @api_router.put("/techniciens/{tech_id}", response_model=TechnicienResponse)
 async def update_technicien(tech_id: str, data: TechnicienCreate, current_user: dict = Depends(get_current_user)):
-    check_access(current_user, ["Super Admin", "Admin", "Responsable"])
+    await check_access_or_permission(current_user, ["Super Admin", "Admin", "Responsable"], "effectif.write")
     update_data = data.model_dump()
     update_data["updated_at"] = datetime.now(timezone.utc).isoformat()
     # Remove old branche field if it exists
@@ -1596,7 +1620,7 @@ async def update_technicien(tech_id: str, data: TechnicienCreate, current_user: 
 
 @api_router.put("/techniciens/{tech_id}/archive")
 async def archive_technicien(tech_id: str, current_user: dict = Depends(get_current_user)):
-    check_access(current_user, ["Super Admin", "Admin"])
+    await check_access_or_permission(current_user, ["Super Admin", "Admin"], "effectif.delete")
     result = await db.techniciens.update_one({"id": tech_id}, {"$set": {"is_archived": True, "updated_at": datetime.now(timezone.utc).isoformat()}})
     if result.modified_count == 0:
         raise HTTPException(status_code=404, detail="Technicien non trouvé")
@@ -1622,7 +1646,7 @@ async def get_materiel(include_archived: bool = False, current_user: dict = Depe
 
 @api_router.post("/materiel", response_model=MaterielResponse)
 async def create_materiel(data: MaterielCreate, current_user: dict = Depends(get_current_user)):
-    check_access(current_user, ["Super Admin", "Admin", "Responsable", "Gestionnaire"])
+    await check_access_or_permission(current_user, ["Super Admin", "Admin", "Responsable", "Gestionnaire"], "logistique.write")
     mat = {
         "id": str(uuid.uuid4()),
         **data.model_dump(),
@@ -1636,7 +1660,7 @@ async def create_materiel(data: MaterielCreate, current_user: dict = Depends(get
 
 @api_router.put("/materiel/{mat_id}", response_model=MaterielResponse)
 async def update_materiel(mat_id: str, data: MaterielCreate, current_user: dict = Depends(get_current_user)):
-    check_access(current_user, ["Super Admin", "Admin", "Responsable", "Gestionnaire"])
+    await check_access_or_permission(current_user, ["Super Admin", "Admin", "Responsable", "Gestionnaire"], "logistique.write")
     update_data = data.model_dump()
     update_data["updated_at"] = datetime.now(timezone.utc).isoformat()
     result = await db.materiel.update_one({"id": mat_id}, {"$set": update_data})
@@ -1648,7 +1672,7 @@ async def update_materiel(mat_id: str, data: MaterielCreate, current_user: dict 
 
 @api_router.put("/materiel/{mat_id}/archive")
 async def archive_materiel(mat_id: str, current_user: dict = Depends(get_current_user)):
-    check_access(current_user, ["Super Admin", "Admin"])
+    await check_access_or_permission(current_user, ["Super Admin", "Admin"], "logistique.delete")
     result = await db.materiel.update_one({"id": mat_id}, {"$set": {"is_archived": True, "updated_at": datetime.now(timezone.utc).isoformat()}})
     if result.modified_count == 0:
         raise HTTPException(status_code=404, detail="Matériel non trouvé")
@@ -1813,7 +1837,7 @@ async def create_devis(data: DevisCreate, current_user: dict = Depends(get_curre
 
 @api_router.put("/devis/{devis_id}/validate")
 async def validate_devis(devis_id: str, current_user: dict = Depends(get_current_user)):
-    check_access(current_user, ["Super Admin", "Admin", "Responsable"])
+    await check_access_or_permission(current_user, ["Super Admin", "Admin", "Responsable"], "devis.validate")
     devis = await db.devis.find_one({"id": devis_id}, {"_id": 0})
     if not devis:
         raise HTTPException(status_code=404, detail="Devis non trouvé")
@@ -1833,7 +1857,7 @@ async def validate_devis(devis_id: str, current_user: dict = Depends(get_current
 
 @api_router.put("/devis/{devis_id}/reject")
 async def reject_devis(devis_id: str, current_user: dict = Depends(get_current_user)):
-    check_access(current_user, ["Super Admin", "Admin", "Responsable"])
+    await check_access_or_permission(current_user, ["Super Admin", "Admin", "Responsable"], "devis.validate")
     devis = await db.devis.find_one({"id": devis_id}, {"_id": 0})
     if not devis:
         raise HTTPException(status_code=404, detail="Devis non trouvé")
@@ -1854,7 +1878,7 @@ async def reject_devis(devis_id: str, current_user: dict = Depends(get_current_u
 @api_router.put("/devis/{devis_id}/revert")
 async def revert_devis(devis_id: str, current_user: dict = Depends(get_current_user)):
     """Send a Validé/Refusé devis back to 'En attente' so it can be re-reviewed."""
-    check_access(current_user, ["Super Admin", "Admin", "Responsable"])
+    await check_access_or_permission(current_user, ["Super Admin", "Admin", "Responsable"], "devis.validate")
     devis = await db.devis.find_one({"id": devis_id}, {"_id": 0})
     result = await db.devis.update_one(
         {"id": devis_id, "statut": {"$in": ["Validé", "Refusé"]}},
@@ -1897,7 +1921,7 @@ async def update_devis(devis_id: str, data: DevisCreate, current_user: dict = De
 
 @api_router.put("/devis/{devis_id}/archive")
 async def archive_devis(devis_id: str, current_user: dict = Depends(get_current_user)):
-    check_access(current_user, ["Super Admin", "Admin"])
+    await check_access_or_permission(current_user, ["Super Admin", "Admin"], "devis.delete")
     result = await db.devis.update_one({"id": devis_id}, {"$set": {"is_archived": True}})
     if result.modified_count == 0:
         raise HTTPException(status_code=404, detail="Devis non trouvé")
@@ -2168,7 +2192,7 @@ async def create_formation_suggestion(data: FormationSuggestionCreate, current_u
 
 @api_router.get("/formation-suggestions", response_model=List[FormationSuggestionResponse])
 async def get_formation_suggestions(include_archived: bool = False, current_user: dict = Depends(get_current_user)):
-    check_access(current_user, ["Super Admin", "Admin", "Responsable", "Gestionnaire"])
+    await check_access_or_permission(current_user, ["Super Admin", "Admin", "Responsable", "Gestionnaire"], "formations.validate")
     query = {} if include_archived else {"is_archived": {"$ne": True}}
     suggestions = await db.formation_suggestions.find(query, {"_id": 0}).sort("created_at", -1).to_list(1000)
     return [FormationSuggestionResponse(**s) for s in suggestions]
@@ -2200,7 +2224,7 @@ async def archive_formation_suggestion(suggestion_id: str, current_user: dict = 
 
 @api_router.put("/formation-suggestions/{suggestion_id}/unarchive")
 async def unarchive_formation_suggestion(suggestion_id: str, current_user: dict = Depends(get_current_user)):
-    check_access(current_user, ["Super Admin", "Admin", "Responsable", "Gestionnaire"])
+    await check_access_or_permission(current_user, ["Super Admin", "Admin", "Responsable", "Gestionnaire"], "formations.write")
     result = await db.formation_suggestions.update_one(
         {"id": suggestion_id},
         {"$set": {"is_archived": False, "archived_at": None}}
@@ -2237,7 +2261,7 @@ async def withdraw_formation_suggestion(suggestion_id: str, current_user: dict =
 
 @api_router.put("/formation-suggestions/{suggestion_id}/status", response_model=FormationSuggestionResponse)
 async def update_formation_suggestion_status(suggestion_id: str, data: FormationSuggestionStatusUpdate, current_user: dict = Depends(get_current_user)):
-    check_access(current_user, ["Super Admin", "Admin", "Responsable", "Gestionnaire"])
+    await check_access_or_permission(current_user, ["Super Admin", "Admin", "Responsable", "Gestionnaire"], "formations.validate")
     suggestion = await db.formation_suggestions.find_one({"id": suggestion_id}, {"_id": 0})
     if not suggestion:
         raise HTTPException(status_code=404, detail="Suggestion non trouvée")
@@ -2283,7 +2307,7 @@ async def update_formation_suggestion_status(suggestion_id: str, data: Formation
 
 @api_router.put("/formations/{formation_id}/archive")
 async def archive_formation(formation_id: str, current_user: dict = Depends(get_current_user)):
-    check_access(current_user, ["Super Admin", "Admin"])
+    await check_access_or_permission(current_user, ["Super Admin", "Admin"], "formations.delete")
     result = await db.formations.update_one(
         {"id": formation_id},
         {"$set": {"is_archived": True, "archived_at": datetime.now(timezone.utc).isoformat()}}
@@ -2334,7 +2358,7 @@ async def create_planning(data: PlanningCreate, current_user: dict = Depends(get
     # Gestionnaire is included so they can save the Absences/Notes fields they're
     # allowed to edit in the web Planning; the UI itself keeps the affectation
     # grid cells read-only for anyone below Responsable.
-    check_access(current_user, ["Super Admin", "Admin", "Responsable", "Gestionnaire"])
+    await check_access_or_permission(current_user, ["Super Admin", "Admin", "Responsable", "Gestionnaire"], "planning.write")
     existing = await db.planning.find_one({"annee": data.annee, "mois": data.mois, "is_archived": False})
     if existing:
         raise HTTPException(status_code=400, detail="Un planning existe déjà pour ce mois")
@@ -2363,7 +2387,7 @@ async def create_planning(data: PlanningCreate, current_user: dict = Depends(get
 async def update_planning(planning_id: str, data: PlanningCreate, current_user: dict = Depends(get_current_user)):
     # Same rationale as create_planning above: Gestionnaire needs to be able
     # to save after editing Absences/Notes.
-    check_access(current_user, ["Super Admin", "Admin", "Responsable", "Gestionnaire"])
+    await check_access_or_permission(current_user, ["Super Admin", "Admin", "Responsable", "Gestionnaire"], "planning.write")
     update_data = {
         "dates": data.dates,
         "affectations": data.affectations,
@@ -2384,7 +2408,7 @@ async def update_planning(planning_id: str, data: PlanningCreate, current_user: 
 
 @api_router.put("/planning/{planning_id}/archive")
 async def archive_planning(planning_id: str, current_user: dict = Depends(get_current_user)):
-    check_access(current_user, ["Super Admin", "Admin"])
+    await check_access_or_permission(current_user, ["Super Admin", "Admin"], "planning.delete")
     result = await db.planning.update_one({"id": planning_id}, {"$set": {"is_archived": True, "updated_at": datetime.now(timezone.utc).isoformat()}})
     if result.modified_count == 0:
         raise HTTPException(status_code=404, detail="Planning non trouvé")
@@ -2985,7 +3009,7 @@ async def get_salles(include_archived: bool = False, current_user: dict = Depend
 
 @api_router.post("/salles", response_model=SalleResponse)
 async def create_salle(data: SalleCreate, current_user: dict = Depends(get_current_user)):
-    check_access(current_user, ["Super Admin", "Admin"])
+    await check_access_or_permission(current_user, ["Super Admin", "Admin"], "salles.write")
     salle = {
         "id": str(uuid.uuid4()),
         **data.model_dump(),
@@ -2998,7 +3022,7 @@ async def create_salle(data: SalleCreate, current_user: dict = Depends(get_curre
 
 @api_router.put("/salles/{salle_id}", response_model=SalleResponse)
 async def update_salle(salle_id: str, data: SalleCreate, current_user: dict = Depends(get_current_user)):
-    check_access(current_user, ["Super Admin", "Admin"])
+    await check_access_or_permission(current_user, ["Super Admin", "Admin"], "salles.write")
     result = await db.salles.update_one({"id": salle_id}, {"$set": data.model_dump()})
     if result.modified_count == 0:
         raise HTTPException(status_code=404, detail="Salle non trouvée")
@@ -3024,7 +3048,7 @@ async def get_creneaux(current_user: dict = Depends(get_current_user)):
 
 @api_router.post("/creneaux", response_model=CreneauResponse)
 async def create_creneau(data: CreneauCreate, current_user: dict = Depends(get_current_user)):
-    check_access(current_user, ["Super Admin", "Admin"])
+    await check_access_or_permission(current_user, ["Super Admin", "Admin"], "salles.write")
     creneau = {
         "id": str(uuid.uuid4()),
         **data.model_dump(),
@@ -3037,7 +3061,7 @@ async def create_creneau(data: CreneauCreate, current_user: dict = Depends(get_c
 
 @api_router.put("/creneaux/{creneau_id}", response_model=CreneauResponse)
 async def update_creneau(creneau_id: str, data: CreneauCreate, current_user: dict = Depends(get_current_user)):
-    check_access(current_user, ["Super Admin", "Admin"])
+    await check_access_or_permission(current_user, ["Super Admin", "Admin"], "salles.write")
     result = await db.creneaux.update_one({"id": creneau_id}, {"$set": data.model_dump()})
     if result.modified_count == 0:
         raise HTTPException(status_code=404, detail="Créneau non trouvé")
@@ -3228,7 +3252,7 @@ async def get_reservations(statut: Optional[str] = None, current_user: dict = De
 
 @api_router.put("/reservations/{reservation_id}/validate")
 async def validate_reservation(reservation_id: str, current_user: dict = Depends(get_current_user)):
-    check_access(current_user, ["Super Admin", "Admin", "Responsable"])
+    await check_access_or_permission(current_user, ["Super Admin", "Admin", "Responsable"], "salles.reservations")
     
     # Check for overlap again before validating
     reservation = await db.reservations.find_one({"id": reservation_id}, {"_id": 0})
@@ -3268,7 +3292,7 @@ async def validate_reservation(reservation_id: str, current_user: dict = Depends
 
 @api_router.put("/reservations/{reservation_id}/reject")
 async def reject_reservation(reservation_id: str, data: RejectReservationRequest, current_user: dict = Depends(get_current_user)):
-    check_access(current_user, ["Super Admin", "Admin", "Responsable"])
+    await check_access_or_permission(current_user, ["Super Admin", "Admin", "Responsable"], "salles.reservations")
     reservation = await db.reservations.find_one({"id": reservation_id}, {"_id": 0})
     if not reservation:
         raise HTTPException(status_code=404, detail="Réservation non trouvée")
@@ -3295,7 +3319,7 @@ async def reject_reservation(reservation_id: str, data: RejectReservationRequest
 @api_router.post("/reservations/admin", response_model=ReservationResponse)
 async def create_admin_reservation(data: AdminReservationCreate, current_user: dict = Depends(get_current_user)):
     """Admin can directly create and optionally validate a reservation/meeting"""
-    check_access(current_user, ["Super Admin", "Admin", "Responsable"])
+    await check_access_or_permission(current_user, ["Super Admin", "Admin", "Responsable"], "salles.reservations")
     
     # Validate salle exists
     salle = await db.salles.find_one({"id": data.salle_id}, {"_id": 0})
