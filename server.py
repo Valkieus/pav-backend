@@ -1619,7 +1619,7 @@ async def get_technicien(tech_id: str, current_user: dict = Depends(get_current_
 
 @api_router.post("/techniciens", response_model=TechnicienResponse)
 async def create_technicien(data: TechnicienCreate, current_user: dict = Depends(get_current_user)):
-    await check_access_or_permission(current_user, ["Super Admin", "Admin", "Responsable"], "effectif.write")
+    await check_access_or_permission(current_user, ["Super Admin", "Responsable"], "effectif.write")
     tech = {
         "id": str(uuid.uuid4()),
         **data.model_dump(),
@@ -1633,7 +1633,7 @@ async def create_technicien(data: TechnicienCreate, current_user: dict = Depends
 
 @api_router.put("/techniciens/{tech_id}", response_model=TechnicienResponse)
 async def update_technicien(tech_id: str, data: TechnicienCreate, current_user: dict = Depends(get_current_user)):
-    await check_access_or_permission(current_user, ["Super Admin", "Admin", "Responsable"], "effectif.write")
+    await check_access_or_permission(current_user, ["Super Admin", "Responsable"], "effectif.write")
     update_data = data.model_dump()
     update_data["updated_at"] = datetime.now(timezone.utc).isoformat()
     # Remove old branche field if it exists
@@ -1647,7 +1647,7 @@ async def update_technicien(tech_id: str, data: TechnicienCreate, current_user: 
 
 @api_router.put("/techniciens/{tech_id}/archive")
 async def archive_technicien(tech_id: str, current_user: dict = Depends(get_current_user)):
-    await check_access_or_permission(current_user, ["Super Admin", "Admin"], "effectif.delete")
+    await check_access_or_permission(current_user, ["Super Admin"], "effectif.delete")
     result = await db.techniciens.update_one({"id": tech_id}, {"$set": {"is_archived": True, "updated_at": datetime.now(timezone.utc).isoformat()}})
     if result.modified_count == 0:
         raise HTTPException(status_code=404, detail="Technicien non trouvé")
@@ -1763,7 +1763,7 @@ async def list_badge_requests(current_user: dict = Depends(get_current_user)):
 @api_router.post("/admin/badges/{user_id}/confirm")
 async def confirm_badge(user_id: str, current_user: dict = Depends(get_current_user)):
     """Marks the badge as validated/issued."""
-    check_access(current_user, ["Gestionnaire", "Responsable", "Admin", "Super Admin"])
+    check_access(current_user, ["Gestionnaire", "Responsable", "Super Admin"])
     target = await db.users.find_one({"id": user_id}, {"_id": 0})
     if not target:
         raise HTTPException(status_code=404, detail="Utilisateur introuvable")
@@ -1790,7 +1790,7 @@ async def confirm_badge(user_id: str, current_user: dict = Depends(get_current_u
 async def reject_badge(user_id: str, data: BadgeRejectRequest, current_user: dict = Depends(get_current_user)):
     """Flags the submitted photo as non-compliant, with a message explaining
     why, sent back to the member so they can resubmit."""
-    check_access(current_user, ["Gestionnaire", "Responsable", "Admin", "Super Admin"])
+    check_access(current_user, ["Gestionnaire", "Responsable", "Super Admin"])
     target = await db.users.find_one({"id": user_id}, {"_id": 0})
     if not target:
         raise HTTPException(status_code=404, detail="Utilisateur introuvable")
@@ -1821,7 +1821,7 @@ async def get_materiel(include_archived: bool = False, current_user: dict = Depe
 
 @api_router.post("/materiel", response_model=MaterielResponse)
 async def create_materiel(data: MaterielCreate, current_user: dict = Depends(get_current_user)):
-    await check_access_or_permission(current_user, ["Super Admin", "Admin", "Responsable", "Gestionnaire"], "logistique.write")
+    await check_access_or_permission(current_user, ["Super Admin", "Responsable", "Gestionnaire"], "logistique.write")
     mat = {
         "id": str(uuid.uuid4()),
         **data.model_dump(),
@@ -1835,7 +1835,7 @@ async def create_materiel(data: MaterielCreate, current_user: dict = Depends(get
 
 @api_router.put("/materiel/{mat_id}", response_model=MaterielResponse)
 async def update_materiel(mat_id: str, data: MaterielCreate, current_user: dict = Depends(get_current_user)):
-    await check_access_or_permission(current_user, ["Super Admin", "Admin", "Responsable", "Gestionnaire"], "logistique.write")
+    await check_access_or_permission(current_user, ["Super Admin", "Responsable", "Gestionnaire"], "logistique.write")
     update_data = data.model_dump()
     update_data["updated_at"] = datetime.now(timezone.utc).isoformat()
     result = await db.materiel.update_one({"id": mat_id}, {"$set": update_data})
@@ -1847,7 +1847,7 @@ async def update_materiel(mat_id: str, data: MaterielCreate, current_user: dict 
 
 @api_router.put("/materiel/{mat_id}/archive")
 async def archive_materiel(mat_id: str, current_user: dict = Depends(get_current_user)):
-    await check_access_or_permission(current_user, ["Super Admin", "Admin"], "logistique.delete")
+    await check_access_or_permission(current_user, ["Super Admin"], "logistique.delete")
     result = await db.materiel.update_one({"id": mat_id}, {"$set": {"is_archived": True, "updated_at": datetime.now(timezone.utc).isoformat()}})
     if result.modified_count == 0:
         raise HTTPException(status_code=404, detail="Matériel non trouvé")
@@ -1879,7 +1879,7 @@ async def get_materiel_categories(current_user: dict = Depends(get_current_user)
 @api_router.post("/materiel/categories")
 async def create_materiel_category(data: dict, current_user: dict = Depends(get_current_user)):
     """Add a new dynamic materiel category"""
-    check_access(current_user, ["Super Admin", "Admin"])
+    check_access(current_user, ["Super Admin"])
     nom = data.get('nom', '').strip()
     if not nom:
         raise HTTPException(status_code=400, detail="Nom de catégorie requis")
@@ -1919,7 +1919,7 @@ async def get_fournisseurs(include_archived: bool = False, current_user: dict = 
 
 @api_router.post("/fournisseurs", response_model=FournisseurResponse)
 async def create_fournisseur(data: FournisseurCreate, current_user: dict = Depends(get_current_user)):
-    check_access(current_user, ["Super Admin", "Admin", "Responsable"])
+    check_access(current_user, ["Super Admin", "Responsable"])
     fournisseur = {
         "id": str(uuid.uuid4()),
         **data.model_dump(),
@@ -1934,7 +1934,7 @@ async def create_fournisseur(data: FournisseurCreate, current_user: dict = Depen
 
 @api_router.put("/fournisseurs/{fournisseur_id}", response_model=FournisseurResponse)
 async def update_fournisseur(fournisseur_id: str, data: FournisseurCreate, current_user: dict = Depends(get_current_user)):
-    check_access(current_user, ["Super Admin", "Admin", "Responsable"])
+    check_access(current_user, ["Super Admin", "Responsable"])
     update_data = data.model_dump()
     update_data["updated_at"] = datetime.now(timezone.utc).isoformat()
     result = await db.fournisseurs.update_one({"id": fournisseur_id}, {"$set": update_data})
@@ -1946,7 +1946,7 @@ async def update_fournisseur(fournisseur_id: str, data: FournisseurCreate, curre
 
 @api_router.put("/fournisseurs/{fournisseur_id}/archive")
 async def archive_fournisseur(fournisseur_id: str, current_user: dict = Depends(get_current_user)):
-    check_access(current_user, ["Super Admin", "Admin"])
+    check_access(current_user, ["Super Admin"])
     result = await db.fournisseurs.update_one({"id": fournisseur_id}, {"$set": {"is_archived": True, "updated_at": datetime.now(timezone.utc).isoformat()}})
     if result.modified_count == 0:
         raise HTTPException(status_code=404, detail="Fournisseur non trouvé")
@@ -2012,7 +2012,7 @@ async def create_devis(data: DevisCreate, current_user: dict = Depends(get_curre
 
 @api_router.put("/devis/{devis_id}/validate")
 async def validate_devis(devis_id: str, current_user: dict = Depends(get_current_user)):
-    await check_access_or_permission(current_user, ["Super Admin", "Admin", "Responsable"], "devis.validate")
+    await check_access_or_permission(current_user, ["Super Admin", "Responsable"], "devis.validate")
     devis = await db.devis.find_one({"id": devis_id}, {"_id": 0})
     if not devis:
         raise HTTPException(status_code=404, detail="Devis non trouvé")
@@ -2032,7 +2032,7 @@ async def validate_devis(devis_id: str, current_user: dict = Depends(get_current
 
 @api_router.put("/devis/{devis_id}/reject")
 async def reject_devis(devis_id: str, current_user: dict = Depends(get_current_user)):
-    await check_access_or_permission(current_user, ["Super Admin", "Admin", "Responsable"], "devis.validate")
+    await check_access_or_permission(current_user, ["Super Admin", "Responsable"], "devis.validate")
     devis = await db.devis.find_one({"id": devis_id}, {"_id": 0})
     if not devis:
         raise HTTPException(status_code=404, detail="Devis non trouvé")
@@ -2053,7 +2053,7 @@ async def reject_devis(devis_id: str, current_user: dict = Depends(get_current_u
 @api_router.put("/devis/{devis_id}/revert")
 async def revert_devis(devis_id: str, current_user: dict = Depends(get_current_user)):
     """Send a Validé/Refusé devis back to 'En attente' so it can be re-reviewed."""
-    await check_access_or_permission(current_user, ["Super Admin", "Admin", "Responsable"], "devis.validate")
+    await check_access_or_permission(current_user, ["Super Admin", "Responsable"], "devis.validate")
     devis = await db.devis.find_one({"id": devis_id}, {"_id": 0})
     result = await db.devis.update_one(
         {"id": devis_id, "statut": {"$in": ["Validé", "Refusé"]}},
@@ -2096,7 +2096,7 @@ async def update_devis(devis_id: str, data: DevisCreate, current_user: dict = De
 
 @api_router.put("/devis/{devis_id}/archive")
 async def archive_devis(devis_id: str, current_user: dict = Depends(get_current_user)):
-    await check_access_or_permission(current_user, ["Super Admin", "Admin"], "devis.delete")
+    await check_access_or_permission(current_user, ["Super Admin"], "devis.delete")
     result = await db.devis.update_one({"id": devis_id}, {"$set": {"is_archived": True}})
     if result.modified_count == 0:
         raise HTTPException(status_code=404, detail="Devis non trouvé")
@@ -2399,7 +2399,7 @@ async def archive_formation_suggestion(suggestion_id: str, current_user: dict = 
 
 @api_router.put("/formation-suggestions/{suggestion_id}/unarchive")
 async def unarchive_formation_suggestion(suggestion_id: str, current_user: dict = Depends(get_current_user)):
-    await check_access_or_permission(current_user, ["Super Admin", "Admin", "Responsable", "Gestionnaire"], "formations.write")
+    await check_access_or_permission(current_user, ["Super Admin", "Responsable", "Gestionnaire"], "formations.write")
     result = await db.formation_suggestions.update_one(
         {"id": suggestion_id},
         {"$set": {"is_archived": False, "archived_at": None}}
@@ -2436,7 +2436,7 @@ async def withdraw_formation_suggestion(suggestion_id: str, current_user: dict =
 
 @api_router.put("/formation-suggestions/{suggestion_id}/status", response_model=FormationSuggestionResponse)
 async def update_formation_suggestion_status(suggestion_id: str, data: FormationSuggestionStatusUpdate, current_user: dict = Depends(get_current_user)):
-    await check_access_or_permission(current_user, ["Super Admin", "Admin", "Responsable", "Gestionnaire"], "formations.validate")
+    await check_access_or_permission(current_user, ["Super Admin", "Responsable", "Gestionnaire"], "formations.validate")
     suggestion = await db.formation_suggestions.find_one({"id": suggestion_id}, {"_id": 0})
     if not suggestion:
         raise HTTPException(status_code=404, detail="Suggestion non trouvée")
@@ -2482,7 +2482,7 @@ async def update_formation_suggestion_status(suggestion_id: str, data: Formation
 
 @api_router.put("/formations/{formation_id}/archive")
 async def archive_formation(formation_id: str, current_user: dict = Depends(get_current_user)):
-    await check_access_or_permission(current_user, ["Super Admin", "Admin"], "formations.delete")
+    await check_access_or_permission(current_user, ["Super Admin"], "formations.delete")
     result = await db.formations.update_one(
         {"id": formation_id},
         {"$set": {"is_archived": True, "archived_at": datetime.now(timezone.utc).isoformat()}}
@@ -2533,7 +2533,7 @@ async def create_planning(data: PlanningCreate, current_user: dict = Depends(get
     # Gestionnaire is included so they can save the Absences/Notes fields they're
     # allowed to edit in the web Planning; the UI itself keeps the affectation
     # grid cells read-only for anyone below Responsable.
-    await check_access_or_permission(current_user, ["Super Admin", "Admin", "Responsable", "Gestionnaire"], "planning.write")
+    await check_access_or_permission(current_user, ["Super Admin", "Responsable", "Gestionnaire"], "planning.write")
     existing = await db.planning.find_one({"annee": data.annee, "mois": data.mois, "is_archived": False})
     if existing:
         raise HTTPException(status_code=400, detail="Un planning existe déjà pour ce mois")
@@ -2562,7 +2562,7 @@ async def create_planning(data: PlanningCreate, current_user: dict = Depends(get
 async def update_planning(planning_id: str, data: PlanningCreate, current_user: dict = Depends(get_current_user)):
     # Same rationale as create_planning above: Gestionnaire needs to be able
     # to save after editing Absences/Notes.
-    await check_access_or_permission(current_user, ["Super Admin", "Admin", "Responsable", "Gestionnaire"], "planning.write")
+    await check_access_or_permission(current_user, ["Super Admin", "Responsable", "Gestionnaire"], "planning.write")
     update_data = {
         "dates": data.dates,
         "affectations": data.affectations,
@@ -2583,7 +2583,7 @@ async def update_planning(planning_id: str, data: PlanningCreate, current_user: 
 
 @api_router.put("/planning/{planning_id}/archive")
 async def archive_planning(planning_id: str, current_user: dict = Depends(get_current_user)):
-    await check_access_or_permission(current_user, ["Super Admin", "Admin"], "planning.delete")
+    await check_access_or_permission(current_user, ["Super Admin"], "planning.delete")
     result = await db.planning.update_one({"id": planning_id}, {"$set": {"is_archived": True, "updated_at": datetime.now(timezone.utc).isoformat()}})
     if result.modified_count == 0:
         raise HTTPException(status_code=404, detail="Planning non trouvé")
@@ -2686,7 +2686,7 @@ async def get_actualites_public():
 
 @api_router.post("/actualites", response_model=ActualiteResponse)
 async def create_actualite(data: ActualiteCreate, current_user: dict = Depends(get_current_user)):
-    check_access(current_user, ["Super Admin", "Admin", "Responsable", "Gestionnaire"])
+    check_access(current_user, ["Super Admin", "Responsable", "Gestionnaire"])
     actualite = {
         "id": str(uuid.uuid4()),
         "titre": data.titre,
@@ -2704,7 +2704,7 @@ async def create_actualite(data: ActualiteCreate, current_user: dict = Depends(g
 
 @api_router.put("/actualites/{actualite_id}", response_model=ActualiteResponse)
 async def update_actualite(actualite_id: str, data: ActualiteCreate, current_user: dict = Depends(get_current_user)):
-    check_access(current_user, ["Super Admin", "Admin", "Responsable", "Gestionnaire"])
+    check_access(current_user, ["Super Admin", "Responsable", "Gestionnaire"])
     update_data = {
         "titre": data.titre,
         "description": data.description,
@@ -2721,7 +2721,7 @@ async def update_actualite(actualite_id: str, data: ActualiteCreate, current_use
 
 @api_router.delete("/actualites/{actualite_id}")
 async def delete_actualite(actualite_id: str, current_user: dict = Depends(get_current_user)):
-    check_access(current_user, ["Super Admin", "Admin"])
+    check_access(current_user, ["Super Admin"])
     result = await db.actualites.delete_one({"id": actualite_id})
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Actualité non trouvée")
@@ -2737,7 +2737,7 @@ async def get_document_categories(current_user: dict = Depends(get_current_user)
 
 @api_router.post("/documents/categories", response_model=DocumentCategoryResponse)
 async def create_document_category(data: DocumentCategoryCreate, current_user: dict = Depends(get_current_user)):
-    check_access(current_user, ["Super Admin", "Admin"])
+    check_access(current_user, ["Super Admin"])
     category = {
         "id": str(uuid.uuid4()),
         "nom": data.nom,
@@ -2750,7 +2750,7 @@ async def create_document_category(data: DocumentCategoryCreate, current_user: d
 
 @api_router.put("/documents/categories/{category_id}", response_model=DocumentCategoryResponse)
 async def update_document_category(category_id: str, data: DocumentCategoryCreate, current_user: dict = Depends(get_current_user)):
-    check_access(current_user, ["Super Admin", "Admin"])
+    check_access(current_user, ["Super Admin"])
     update_data = {"nom": data.nom, "description": data.description}
     result = await db.document_categories.update_one({"id": category_id}, {"$set": update_data})
     if result.modified_count == 0:
@@ -2790,7 +2790,7 @@ async def get_documents(current_user: dict = Depends(get_current_user)):
 
 @api_router.post("/documents", response_model=DocumentResponse)
 async def create_document(data: DocumentCreate, current_user: dict = Depends(get_current_user)):
-    check_access(current_user, ["Super Admin", "Admin", "Responsable", "Gestionnaire"])
+    check_access(current_user, ["Super Admin", "Responsable", "Gestionnaire"])
     # Get category name
     category = await db.document_categories.find_one({"id": data.categorie_id}, {"_id": 0})
     categorie_nom = category['nom'] if category else 'Sans catégorie'
@@ -2814,7 +2814,7 @@ async def create_document(data: DocumentCreate, current_user: dict = Depends(get
 
 @api_router.put("/documents/{document_id}", response_model=DocumentResponse)
 async def update_document(document_id: str, data: DocumentCreate, current_user: dict = Depends(get_current_user)):
-    check_access(current_user, ["Super Admin", "Admin", "Responsable", "Gestionnaire"])
+    check_access(current_user, ["Super Admin", "Responsable", "Gestionnaire"])
     category = await db.document_categories.find_one({"id": data.categorie_id}, {"_id": 0})
     categorie_nom = category['nom'] if category else 'Sans catégorie'
 
@@ -2835,7 +2835,7 @@ async def update_document(document_id: str, data: DocumentCreate, current_user: 
 
 @api_router.delete("/documents/{document_id}")
 async def delete_document(document_id: str, current_user: dict = Depends(get_current_user)):
-    check_access(current_user, ["Super Admin", "Admin"])
+    check_access(current_user, ["Super Admin"])
     result = await db.documents.delete_one({"id": document_id})
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Document non trouvé")
@@ -2909,7 +2909,7 @@ class ServiceInfoUpdate(BaseModel):
 
 @api_router.put("/dashboard/service-info")
 async def update_service_info_text(data: ServiceInfoUpdate, current_user: dict = Depends(get_current_user)):
-    check_access(current_user, ["Super Admin", "Admin", "Responsable"])
+    check_access(current_user, ["Super Admin", "Responsable"])
     text = data.text.strip()
     if not text:
         raise HTTPException(status_code=400, detail="Le texte ne peut pas être vide")
@@ -3002,7 +3002,7 @@ async def get_organigramme(current_user: dict = Depends(get_current_user)):
 
 @api_router.put("/organigramme")
 async def update_organigramme(data: dict, current_user: dict = Depends(get_current_user)):
-    check_access(current_user, ["Super Admin", "Admin"])
+    check_access(current_user, ["Super Admin"])
     # Update the structure field
     await db.organigramme.update_one(
         {},
@@ -3038,7 +3038,7 @@ SUPERVISED_COLLECTIONS = [
 
 @api_router.get("/admin/system-status")
 async def get_system_status(current_user: dict = Depends(get_current_user)):
-    check_access(current_user, ["Super Admin"])
+    check_access(current_user, ["Super Admin", "Admin"])
 
     mongo_ok = True
     mongo_error = None
@@ -3144,7 +3144,7 @@ async def _find_orphaned_file_ids() -> List[str]:
 
 @api_router.get("/admin/cleanup/orphaned-files")
 async def preview_orphaned_files(current_user: dict = Depends(get_current_user)):
-    check_access(current_user, ["Super Admin"])
+    check_access(current_user, ["Super Admin", "Admin"])
     orphaned_ids = await _find_orphaned_file_ids()
     total_bytes = 0
     if orphaned_ids:
@@ -3230,7 +3230,7 @@ async def restart_server(current_user: dict = Depends(get_current_user)):
 # quelque chose de sensible qui serait ajouté plus tard sans y penser ici.
 @api_router.get("/admin/export/{collection_name}")
 async def export_collection(collection_name: str, format: str = "json", current_user: dict = Depends(get_current_user)):
-    check_access(current_user, ["Super Admin"])
+    check_access(current_user, ["Super Admin", "Admin"])
     if collection_name not in SUPERVISED_COLLECTIONS:
         raise HTTPException(status_code=404, detail="Catégorie inconnue")
     if format not in ("json", "csv"):
@@ -3331,7 +3331,7 @@ class CompetenceRename(BaseModel):
 
 @api_router.post("/competences-formation")
 async def add_competence_formation(data: CompetenceCreate, current_user: dict = Depends(get_current_user)):
-    check_access(current_user, ["Super Admin", "Admin"])
+    check_access(current_user, ["Super Admin"])
     label = data.label.strip()
     if not label:
         raise HTTPException(status_code=400, detail="Le nom de la compétence ne peut pas être vide")
@@ -3345,7 +3345,7 @@ async def add_competence_formation(data: CompetenceCreate, current_user: dict = 
 
 @api_router.put("/competences-formation/{label}")
 async def rename_competence_formation(label: str, data: CompetenceRename, current_user: dict = Depends(get_current_user)):
-    check_access(current_user, ["Super Admin", "Admin"])
+    check_access(current_user, ["Super Admin"])
     new_label = data.new_label.strip()
     if not new_label:
         raise HTTPException(status_code=400, detail="Le nouveau nom ne peut pas être vide")
@@ -3361,7 +3361,7 @@ async def rename_competence_formation(label: str, data: CompetenceRename, curren
 
 @api_router.delete("/competences-formation/{label}")
 async def delete_competence_formation(label: str, current_user: dict = Depends(get_current_user)):
-    check_access(current_user, ["Super Admin", "Admin"])
+    check_access(current_user, ["Super Admin"])
     current = await get_competences_formation_list()
     if label not in current:
         raise HTTPException(status_code=404, detail="Compétence introuvable")
@@ -3380,7 +3380,7 @@ class PosteRename(BaseModel):
 
 @api_router.post("/postes")
 async def add_poste(data: PosteCreate, current_user: dict = Depends(get_current_user)):
-    check_access(current_user, ["Super Admin", "Admin"])
+    check_access(current_user, ["Super Admin"])
     label = data.label.strip()
     if not label:
         raise HTTPException(status_code=400, detail="Le nom du poste ne peut pas être vide")
@@ -3394,7 +3394,7 @@ async def add_poste(data: PosteCreate, current_user: dict = Depends(get_current_
 
 @api_router.put("/postes/{label}")
 async def rename_poste(label: str, data: PosteRename, current_user: dict = Depends(get_current_user)):
-    check_access(current_user, ["Super Admin", "Admin"])
+    check_access(current_user, ["Super Admin"])
     new_label = data.new_label.strip()
     if not new_label:
         raise HTTPException(status_code=400, detail="Le nouveau nom ne peut pas être vide")
@@ -3417,7 +3417,7 @@ async def rename_poste(label: str, data: PosteRename, current_user: dict = Depen
 
 @api_router.delete("/postes/{label}")
 async def delete_poste(label: str, current_user: dict = Depends(get_current_user)):
-    check_access(current_user, ["Super Admin", "Admin"])
+    check_access(current_user, ["Super Admin"])
     current = await get_postes_list()
     if label not in current:
         raise HTTPException(status_code=404, detail="Poste introuvable")
@@ -3439,7 +3439,7 @@ async def get_salles(include_archived: bool = False, current_user: dict = Depend
 
 @api_router.post("/salles", response_model=SalleResponse)
 async def create_salle(data: SalleCreate, current_user: dict = Depends(get_current_user)):
-    await check_access_or_permission(current_user, ["Super Admin", "Admin"], "salles.write")
+    await check_access_or_permission(current_user, ["Super Admin"], "salles.write")
     salle = {
         "id": str(uuid.uuid4()),
         **data.model_dump(),
@@ -3452,7 +3452,7 @@ async def create_salle(data: SalleCreate, current_user: dict = Depends(get_curre
 
 @api_router.put("/salles/{salle_id}", response_model=SalleResponse)
 async def update_salle(salle_id: str, data: SalleCreate, current_user: dict = Depends(get_current_user)):
-    await check_access_or_permission(current_user, ["Super Admin", "Admin"], "salles.write")
+    await check_access_or_permission(current_user, ["Super Admin"], "salles.write")
     result = await db.salles.update_one({"id": salle_id}, {"$set": data.model_dump()})
     if result.modified_count == 0:
         raise HTTPException(status_code=404, detail="Salle non trouvée")
@@ -3478,7 +3478,7 @@ async def get_creneaux(current_user: dict = Depends(get_current_user)):
 
 @api_router.post("/creneaux", response_model=CreneauResponse)
 async def create_creneau(data: CreneauCreate, current_user: dict = Depends(get_current_user)):
-    await check_access_or_permission(current_user, ["Super Admin", "Admin"], "salles.write")
+    await check_access_or_permission(current_user, ["Super Admin"], "salles.write")
     creneau = {
         "id": str(uuid.uuid4()),
         **data.model_dump(),
@@ -3491,7 +3491,7 @@ async def create_creneau(data: CreneauCreate, current_user: dict = Depends(get_c
 
 @api_router.put("/creneaux/{creneau_id}", response_model=CreneauResponse)
 async def update_creneau(creneau_id: str, data: CreneauCreate, current_user: dict = Depends(get_current_user)):
-    await check_access_or_permission(current_user, ["Super Admin", "Admin"], "salles.write")
+    await check_access_or_permission(current_user, ["Super Admin"], "salles.write")
     result = await db.creneaux.update_one({"id": creneau_id}, {"$set": data.model_dump()})
     if result.modified_count == 0:
         raise HTTPException(status_code=404, detail="Créneau non trouvé")
@@ -3682,7 +3682,7 @@ async def get_reservations(statut: Optional[str] = None, current_user: dict = De
 
 @api_router.put("/reservations/{reservation_id}/validate")
 async def validate_reservation(reservation_id: str, current_user: dict = Depends(get_current_user)):
-    await check_access_or_permission(current_user, ["Super Admin", "Admin", "Responsable"], "salles.reservations")
+    await check_access_or_permission(current_user, ["Super Admin", "Responsable"], "salles.reservations")
     
     # Check for overlap again before validating
     reservation = await db.reservations.find_one({"id": reservation_id}, {"_id": 0})
@@ -3722,7 +3722,7 @@ async def validate_reservation(reservation_id: str, current_user: dict = Depends
 
 @api_router.put("/reservations/{reservation_id}/reject")
 async def reject_reservation(reservation_id: str, data: RejectReservationRequest, current_user: dict = Depends(get_current_user)):
-    await check_access_or_permission(current_user, ["Super Admin", "Admin", "Responsable"], "salles.reservations")
+    await check_access_or_permission(current_user, ["Super Admin", "Responsable"], "salles.reservations")
     reservation = await db.reservations.find_one({"id": reservation_id}, {"_id": 0})
     if not reservation:
         raise HTTPException(status_code=404, detail="Réservation non trouvée")
@@ -3749,7 +3749,7 @@ async def reject_reservation(reservation_id: str, data: RejectReservationRequest
 @api_router.post("/reservations/admin", response_model=ReservationResponse)
 async def create_admin_reservation(data: AdminReservationCreate, current_user: dict = Depends(get_current_user)):
     """Admin can directly create and optionally validate a reservation/meeting"""
-    await check_access_or_permission(current_user, ["Super Admin", "Admin", "Responsable"], "salles.reservations")
+    await check_access_or_permission(current_user, ["Super Admin", "Responsable"], "salles.reservations")
     
     # Validate salle exists
     salle = await db.salles.find_one({"id": data.salle_id}, {"_id": 0})
@@ -3843,7 +3843,7 @@ class EmailTemplateUpdate(BaseModel):
 
 @api_router.put("/email-templates/{key}")
 async def update_email_template(key: str, data: EmailTemplateUpdate, current_user: dict = Depends(get_current_user)):
-    check_access(current_user, ["Super Admin", "Admin", "Responsable"])
+    check_access(current_user, ["Super Admin", "Responsable"])
     if key not in DEFAULT_EMAIL_TEMPLATES:
         raise HTTPException(status_code=404, detail="Modèle inconnu")
     await db.email_templates.update_one(
@@ -3856,7 +3856,7 @@ async def update_email_template(key: str, data: EmailTemplateUpdate, current_use
 
 @api_router.post("/email-templates/{key}/reset")
 async def reset_email_template(key: str, current_user: dict = Depends(get_current_user)):
-    check_access(current_user, ["Super Admin", "Admin", "Responsable"])
+    check_access(current_user, ["Super Admin", "Responsable"])
     if key not in DEFAULT_EMAIL_TEMPLATES:
         raise HTTPException(status_code=404, detail="Modèle inconnu")
     await db.email_templates.delete_one({"key": key})
@@ -3894,7 +3894,7 @@ async def get_salles_notification_settings(current_user: dict = Depends(get_curr
 
 @api_router.put("/salles/notification-settings/{case}")
 async def update_salles_notification_settings(case: str, data: NotificationSettingsUpdate, current_user: dict = Depends(get_current_user)):
-    check_access(current_user, ["Super Admin", "Admin"])
+    check_access(current_user, ["Super Admin"])
     if case not in SALLES_NOTIFICATION_CASES:
         raise HTTPException(status_code=404, detail="Cas de notification inconnu")
     await db.notification_settings.update_one(
@@ -4024,7 +4024,7 @@ async def upload_file(file: UploadFile = File(...), current_user: dict = Depends
     restart, which used to silently delete previously uploaded images (e.g.
     Actualités photos). MongoDB is the persistent store, so this survives
     redeploys."""
-    check_access(current_user, ["Super Admin", "Admin", "Responsable"])
+    check_access(current_user, ["Super Admin", "Responsable"])
 
     if not file.filename:
         raise HTTPException(status_code=400, detail="Aucun fichier fourni")
