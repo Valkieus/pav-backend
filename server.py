@@ -290,6 +290,32 @@ class FormationResponse(BaseModel):
     motif_refus: Optional[str] = None
     refused_stage: Optional[str] = None  # "coordination" | "direction"
     is_archived: bool
+    disponible_catalogue: Optional[bool] = False
+
+class FormationCatalogueToggle(BaseModel):
+    disponible_catalogue: bool
+
+# Formation suggestions — a lightweight channel (distinct from the full
+# Coordination -> Direction request workflow above) that lets ANY user,
+# including Membre, suggest a new formation topic or express interest in
+# an existing catalogue formation. Coordination/Admin review these.
+class FormationSuggestionCreate(BaseModel):
+    titre: str
+    description: Optional[str] = ""
+    formation_id: Optional[str] = None  # set when it's "interest" in an existing catalogue item
+
+class FormationSuggestionStatusUpdate(BaseModel):
+    statut: str  # "Approuvée" | "Rejetée"
+
+class FormationSuggestionResponse(BaseModel):
+    id: str
+    titre: str
+    description: Optional[str] = ""
+    formation_id: Optional[str] = None
+    statut: str
+    created_by: str
+    created_by_name: str
+    created_at: str
 
 # Actualités models
 class ActualiteCreate(BaseModel):
@@ -1935,6 +1961,67 @@ async def final_reject_formation(formation_id: str, data: FormationRejectReason,
         kind="danger"
     ))
     return FormationResponse(**formation)
+
+@api_router.get("/formations/catalogue", response_model=List[FormationResponse])
+async def get_formations_catalogue(current_user: dict = Depends(get_current_user)):
+    """Public-to-all-users list of formations Coordination has marked as
+    available in the catalogue — what Membres can browse from Mon espace."""
+    formations = await db.formations.find(
+        {"is_archived": False, "disponible_catalogue": True}, {"_id": 0}
+    ).to_list(1000)
+    return [FormationResponse(**f) for f in formations]
+
+@api_router.put("/formations/{formation_id}/catalogue", response_model=FormationResponse)
+async def toggle_formation_catalogue(formation_id: str, data: FormationCatalogueToggle, current_user: dict = Depends(get_current_user)):
+    if not is_coordination_or_admin(current_user):
+        raise HTTPException(status_code=403, detail="Réservé à la Coordination")
+    result = await db.formations.update_one({"id": formation_id}, {"$set": {"disponible_catalogue": data.disponible_catalogue}})
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Formation non trouvée")
+    await log_action(current_user['id'], current_user['full_name'], "Catalogue formation",
+                      f"Formation {'ajoutée au' if data.disponible_catalogue else 'retirée du'} catalogue: {formation_id}")
+    formation = await db.formations.find_one({"id": formation_id}, {"_id": 0})
+    return FormationResponse(**formation)
+
+# ==================== FORMATION SUGGESTIONS (Membre-facing) ====================
+
+@api_router.post("/formation-suggestions", response_model=FormationSuggestionResponse)
+async def create_formation_suggestion(data: FormationSuggestionCreate, current_user: dict = Depends(get_current_user)):
+    """Any authenticated user (Membre included) can suggest a new formation
+    topic, or express interest in an existing catalogue formation by
+    passing formation_id."""
+    suggestion = {
+        "id": str(uuid.uuid4()),
+        **data.model_dump(),
+        "statut": "En attente",
+        "created_by": current_user['id'],
+        "created_by_name": current_user['full_name'],
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    await db.formation_suggestions.insert_one(suggestion)
+    await log_action(current_user['id'], current_user['full_name'], "Suggestion formation", f"Suggestion: {data.titre}")
+    return FormationSuggestionResponse(**suggestion)
+
+@api_router.get("/formation-suggestions", response_model=List[FormationSuggestionResponse])
+async def get_formation_suggestions(current_user: dict = Depends(get_current_user)):
+    check_access(current_user, ["Super Admin", "Admin", "Responsable", "Gestionnaire"])
+    suggestions = await db.formation_suggestions.find({}, {"_id": 0}).sort("created_at", -1).to_list(1000)
+    return [FormationSuggestionResponse(**s) for s in suggestions]
+
+@api_router.get("/formation-suggestions/mine", response_model=List[FormationSuggestionResponse])
+async def get_my_formation_suggestions(current_user: dict = Depends(get_current_user)):
+    suggestions = await db.formation_suggestions.find({"created_by": current_user['id']}, {"_id": 0}).sort("created_at", -1).to_list(1000)
+    return [FormationSuggestionResponse(**s) for s in suggestions]
+
+@api_router.put("/formation-suggestions/{suggestion_id}/status", response_model=FormationSuggestionResponse)
+async def update_formation_suggestion_status(suggestion_id: str, data: FormationSuggestionStatusUpdate, current_user: dict = Depends(get_current_user)):
+    check_access(current_user, ["Super Admin", "Admin", "Responsable", "Gestionnaire"])
+    result = await db.formation_suggestions.update_one({"id": suggestion_id}, {"$set": {"statut": data.statut}})
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Suggestion non trouvée")
+    await log_action(current_user['id'], current_user['full_name'], "Suggestion formation", f"Statut mis à jour: {data.statut}")
+    s = await db.formation_suggestions.find_one({"id": suggestion_id}, {"_id": 0})
+    return FormationSuggestionResponse(**s)
 
 @api_router.put("/formations/{formation_id}/archive")
 async def archive_formation(formation_id: str, current_user: dict = Depends(get_current_user)):
