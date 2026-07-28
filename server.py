@@ -60,7 +60,7 @@ async def api_health_check():
 
 # ==================== ENUMS ====================
 NIVEAUX_TECHNICIEN = ["Novice", "Débutant", "Intermédiaire", "Confirmé", "Expert"]
-NIVEAUX_ACCES = ["Membre", "Gestionnaire", "Responsable", "Admin", "Super Admin"]
+NIVEAUX_ACCES = ["Technicien", "Gestionnaire", "Responsable", "Admin", "Super Admin"]  # "Technicien" = ex-"Membre" (renamed, same permissions)
 BRANCHES = ["Supervision", "Coordination", "Production", "Live", "Animation", "Régisseurs", "Diffusion"]
 SOUS_BRANCHES_LIVE = ["Incrustation", "Diffusion", "Cadreur", "Réalisation"]
 # Canonical postes used to filter the Planning assignment dropdown to only
@@ -197,6 +197,19 @@ class TechnicienResponse(BaseModel):
     is_archived: bool
     created_at: str
     updated_at: str
+    # Badge — request/renewal workflow (distinct from the manual "badge_attribue"
+    # flag above, which just records whether a physical badge has ever been
+    # handed out). None | "demande" | "en_attente_validation" | "non_conforme" | "validee"
+    badge_status: Optional[str] = None
+    badge_photo_url: Optional[str] = None
+    badge_is_renewal: Optional[bool] = False
+    badge_requested_at: Optional[str] = None
+    badge_reviewed_at: Optional[str] = None
+    badge_reviewed_by_name: Optional[str] = None
+    badge_message: Optional[str] = None
+
+class BadgeRejectRequest(BaseModel):
+    message: str
 
 class MaterielCreate(BaseModel):
     nom: str
@@ -373,7 +386,7 @@ class DocumentCreate(BaseModel):
     # = visible par tout le monde (comportement historique, rétrocompatible
     # avec les documents existants qui n'ont pas ce champ). Une liste non vide
     # restreint la visibilité à ces niveaux uniquement — typiquement pour
-    # exclure "Membre" des documents internes à la gestion.
+    # exclure "Technicien" des documents internes à la gestion.
     visible_roles: Optional[List[str]] = None
 
 class DocumentResponse(BaseModel):
@@ -1091,75 +1104,75 @@ async def seed_data():
             {"nom": "Gabrielle", "prenom": "", "branches": ["Live"], "sous_branche": None, "niveau_technicien": "Confirmé", "niveau_acces": "Gestionnaire"},
             {"nom": "Nathalie", "prenom": "", "branches": ["Live"], "sous_branche": None, "niveau_technicien": "Expert", "niveau_acces": "Responsable"},
             {"nom": "Tiphaine", "prenom": "", "branches": ["Live"], "sous_branche": None, "niveau_technicien": "Confirmé", "niveau_acces": "Gestionnaire"},
-            {"nom": "Cynthia B.", "prenom": "", "branches": ["Live"], "sous_branche": None, "niveau_technicien": "Intermédiaire", "niveau_acces": "Membre"},
+            {"nom": "Cynthia B.", "prenom": "", "branches": ["Live"], "sous_branche": None, "niveau_technicien": "Intermédiaire", "niveau_acces": "Technicien"},
             {"nom": "Victor", "prenom": "", "branches": ["Live"], "sous_branche": None, "niveau_technicien": "Confirmé", "niveau_acces": "Gestionnaire"},
-            {"nom": "Magda", "prenom": "", "branches": ["Live"], "sous_branche": None, "niveau_technicien": "Intermédiaire", "niveau_acces": "Membre"},
+            {"nom": "Magda", "prenom": "", "branches": ["Live"], "sous_branche": None, "niveau_technicien": "Intermédiaire", "niveau_acces": "Technicien"},
             {"nom": "James", "prenom": "", "branches": ["Live"], "sous_branche": None, "niveau_technicien": "Confirmé", "niveau_acces": "Gestionnaire"},
-            {"nom": "Prisca", "prenom": "", "branches": ["Live"], "sous_branche": None, "niveau_technicien": "Intermédiaire", "niveau_acces": "Membre"},
-            {"nom": "Daniel N", "prenom": "", "branches": ["Live"], "sous_branche": None, "niveau_technicien": "Intermédiaire", "niveau_acces": "Membre"},
+            {"nom": "Prisca", "prenom": "", "branches": ["Live"], "sous_branche": None, "niveau_technicien": "Intermédiaire", "niveau_acces": "Technicien"},
+            {"nom": "Daniel N", "prenom": "", "branches": ["Live"], "sous_branche": None, "niveau_technicien": "Intermédiaire", "niveau_acces": "Technicien"},
             {"nom": "Guichard", "prenom": "", "branches": ["Live", "Supervision"], "sous_branche": None, "niveau_technicien": "Expert", "niveau_acces": "Super Admin"},
             {"nom": "Darwin", "prenom": "", "branches": ["Live"], "sous_branche": None, "niveau_technicien": "Confirmé", "niveau_acces": "Gestionnaire"},
             {"nom": "Elder", "prenom": "", "branches": ["Live"], "sous_branche": None, "niveau_technicien": "Confirmé", "niveau_acces": "Gestionnaire"},
-            {"nom": "Yedidjah", "prenom": "", "branches": ["Live"], "sous_branche": None, "niveau_technicien": "Intermédiaire", "niveau_acces": "Membre"},
-            {"nom": "Jovani", "prenom": "", "branches": ["Live"], "sous_branche": None, "niveau_technicien": "Intermédiaire", "niveau_acces": "Membre"},
+            {"nom": "Yedidjah", "prenom": "", "branches": ["Live"], "sous_branche": None, "niveau_technicien": "Intermédiaire", "niveau_acces": "Technicien"},
+            {"nom": "Jovani", "prenom": "", "branches": ["Live"], "sous_branche": None, "niveau_technicien": "Intermédiaire", "niveau_acces": "Technicien"},
             # Incrustation
             {"nom": "Sybiline", "prenom": "", "branches": ["Live"], "sous_branche": "Incrustation", "niveau_technicien": "Confirmé", "niveau_acces": "Gestionnaire"},
-            {"nom": "Joelle", "prenom": "", "branches": ["Live"], "sous_branche": "Incrustation", "niveau_technicien": "Intermédiaire", "niveau_acces": "Membre"},
-            {"nom": "Esther", "prenom": "", "branches": ["Live"], "sous_branche": "Incrustation", "niveau_technicien": "Intermédiaire", "niveau_acces": "Membre"},
+            {"nom": "Joelle", "prenom": "", "branches": ["Live"], "sous_branche": "Incrustation", "niveau_technicien": "Intermédiaire", "niveau_acces": "Technicien"},
+            {"nom": "Esther", "prenom": "", "branches": ["Live"], "sous_branche": "Incrustation", "niveau_technicien": "Intermédiaire", "niveau_acces": "Technicien"},
             {"nom": "Angelo", "prenom": "", "branches": ["Live"], "sous_branche": "Incrustation", "niveau_technicien": "Expert", "niveau_acces": "Responsable"},
-            {"nom": "Yuna", "prenom": "", "branches": ["Live"], "sous_branche": "Incrustation", "niveau_technicien": "Débutant", "niveau_acces": "Membre"},
+            {"nom": "Yuna", "prenom": "", "branches": ["Live"], "sous_branche": "Incrustation", "niveau_technicien": "Débutant", "niveau_acces": "Technicien"},
             # VFX
             {"nom": "Fabrice", "prenom": "", "branches": ["Animation"], "sous_branche": None, "niveau_technicien": "Confirmé", "niveau_acces": "Gestionnaire"},
             {"nom": "Laura", "prenom": "", "branches": ["Animation"], "sous_branche": None, "niveau_technicien": "Expert", "niveau_acces": "Responsable"},
-            {"nom": "Josué", "prenom": "", "branches": ["Animation"], "sous_branche": None, "niveau_technicien": "Intermédiaire", "niveau_acces": "Membre"},
-            {"nom": "Sara", "prenom": "", "branches": ["Animation"], "sous_branche": None, "niveau_technicien": "Intermédiaire", "niveau_acces": "Membre"},
+            {"nom": "Josué", "prenom": "", "branches": ["Animation"], "sous_branche": None, "niveau_technicien": "Intermédiaire", "niveau_acces": "Technicien"},
+            {"nom": "Sara", "prenom": "", "branches": ["Animation"], "sous_branche": None, "niveau_technicien": "Intermédiaire", "niveau_acces": "Technicien"},
             {"nom": "Nicky", "prenom": "", "branches": ["Animation"], "sous_branche": None, "niveau_technicien": "Confirmé", "niveau_acces": "Gestionnaire"},
-            {"nom": "Océane", "prenom": "", "branches": ["Animation"], "sous_branche": None, "niveau_technicien": "Intermédiaire", "niveau_acces": "Membre"},
+            {"nom": "Océane", "prenom": "", "branches": ["Animation"], "sous_branche": None, "niveau_technicien": "Intermédiaire", "niveau_acces": "Technicien"},
             # Cadreurs
             {"nom": "Bérénice", "prenom": "", "branches": ["Live"], "sous_branche": "Cadreur", "niveau_technicien": "Confirmé", "niveau_acces": "Gestionnaire"},
             {"nom": "Rebecca", "prenom": "", "branches": ["Live"], "sous_branche": "Cadreur", "niveau_technicien": "Confirmé", "niveau_acces": "Gestionnaire"},
-            {"nom": "Martine", "prenom": "", "branches": ["Live"], "sous_branche": "Cadreur", "niveau_technicien": "Intermédiaire", "niveau_acces": "Membre"},
-            {"nom": "Ethan", "prenom": "", "branches": ["Live"], "sous_branche": "Cadreur", "niveau_technicien": "Intermédiaire", "niveau_acces": "Membre"},
-            {"nom": "Pamela", "prenom": "", "branches": ["Live"], "sous_branche": "Cadreur", "niveau_technicien": "Intermédiaire", "niveau_acces": "Membre"},
-            {"nom": "Grace", "prenom": "", "branches": ["Live"], "sous_branche": "Cadreur", "niveau_technicien": "Intermédiaire", "niveau_acces": "Membre"},
-            {"nom": "Stacy", "prenom": "", "branches": ["Live"], "sous_branche": "Cadreur", "niveau_technicien": "Intermédiaire", "niveau_acces": "Membre"},
-            {"nom": "Marie-Sonie", "prenom": "", "branches": ["Live"], "sous_branche": "Cadreur", "niveau_technicien": "Intermédiaire", "niveau_acces": "Membre"},
+            {"nom": "Martine", "prenom": "", "branches": ["Live"], "sous_branche": "Cadreur", "niveau_technicien": "Intermédiaire", "niveau_acces": "Technicien"},
+            {"nom": "Ethan", "prenom": "", "branches": ["Live"], "sous_branche": "Cadreur", "niveau_technicien": "Intermédiaire", "niveau_acces": "Technicien"},
+            {"nom": "Pamela", "prenom": "", "branches": ["Live"], "sous_branche": "Cadreur", "niveau_technicien": "Intermédiaire", "niveau_acces": "Technicien"},
+            {"nom": "Grace", "prenom": "", "branches": ["Live"], "sous_branche": "Cadreur", "niveau_technicien": "Intermédiaire", "niveau_acces": "Technicien"},
+            {"nom": "Stacy", "prenom": "", "branches": ["Live"], "sous_branche": "Cadreur", "niveau_technicien": "Intermédiaire", "niveau_acces": "Technicien"},
+            {"nom": "Marie-Sonie", "prenom": "", "branches": ["Live"], "sous_branche": "Cadreur", "niveau_technicien": "Intermédiaire", "niveau_acces": "Technicien"},
             {"nom": "Jean-Wisler", "prenom": "", "branches": ["Live"], "sous_branche": "Cadreur", "niveau_technicien": "Confirmé", "niveau_acces": "Gestionnaire"},
             {"nom": "Jacob", "prenom": "", "branches": ["Live"], "sous_branche": "Cadreur", "niveau_technicien": "Expert", "niveau_acces": "Responsable"},
-            {"nom": "Brice", "prenom": "", "branches": ["Live"], "sous_branche": "Cadreur", "niveau_technicien": "Intermédiaire", "niveau_acces": "Membre"},
-            {"nom": "Cédric N.", "prenom": "", "branches": ["Live"], "sous_branche": "Cadreur", "niveau_technicien": "Intermédiaire", "niveau_acces": "Membre"},
-            {"nom": "Cynthia M.", "prenom": "", "branches": ["Live"], "sous_branche": "Cadreur", "niveau_technicien": "Intermédiaire", "niveau_acces": "Membre"},
+            {"nom": "Brice", "prenom": "", "branches": ["Live"], "sous_branche": "Cadreur", "niveau_technicien": "Intermédiaire", "niveau_acces": "Technicien"},
+            {"nom": "Cédric N.", "prenom": "", "branches": ["Live"], "sous_branche": "Cadreur", "niveau_technicien": "Intermédiaire", "niveau_acces": "Technicien"},
+            {"nom": "Cynthia M.", "prenom": "", "branches": ["Live"], "sous_branche": "Cadreur", "niveau_technicien": "Intermédiaire", "niveau_acces": "Technicien"},
             {"nom": "Motler", "prenom": "", "branches": ["Live"], "sous_branche": "Cadreur", "niveau_technicien": "Confirmé", "niveau_acces": "Gestionnaire"},
-            {"nom": "Isabelle", "prenom": "", "branches": ["Live"], "sous_branche": "Cadreur", "niveau_technicien": "Intermédiaire", "niveau_acces": "Membre"},
-            {"nom": "Junior", "prenom": "", "branches": ["Live"], "sous_branche": "Cadreur", "niveau_technicien": "Intermédiaire", "niveau_acces": "Membre"},
-            {"nom": "Brunel", "prenom": "", "branches": ["Live"], "sous_branche": "Cadreur", "niveau_technicien": "Intermédiaire", "niveau_acces": "Membre"},
-            {"nom": "Camille", "prenom": "", "branches": ["Live"], "sous_branche": "Cadreur", "niveau_technicien": "Intermédiaire", "niveau_acces": "Membre"},
+            {"nom": "Isabelle", "prenom": "", "branches": ["Live"], "sous_branche": "Cadreur", "niveau_technicien": "Intermédiaire", "niveau_acces": "Technicien"},
+            {"nom": "Junior", "prenom": "", "branches": ["Live"], "sous_branche": "Cadreur", "niveau_technicien": "Intermédiaire", "niveau_acces": "Technicien"},
+            {"nom": "Brunel", "prenom": "", "branches": ["Live"], "sous_branche": "Cadreur", "niveau_technicien": "Intermédiaire", "niveau_acces": "Technicien"},
+            {"nom": "Camille", "prenom": "", "branches": ["Live"], "sous_branche": "Cadreur", "niveau_technicien": "Intermédiaire", "niveau_acces": "Technicien"},
             {"nom": "Marc-Arthur", "prenom": "", "branches": ["Live"], "sous_branche": "Cadreur", "niveau_technicien": "Confirmé", "niveau_acces": "Gestionnaire"},
-            {"nom": "Asony", "prenom": "", "branches": ["Live"], "sous_branche": "Cadreur", "niveau_technicien": "Intermédiaire", "niveau_acces": "Membre"},
-            {"nom": "Daniel JP", "prenom": "", "branches": ["Live"], "sous_branche": "Cadreur", "niveau_technicien": "Intermédiaire", "niveau_acces": "Membre"},
-            {"nom": "Frandjy", "prenom": "", "branches": ["Live"], "sous_branche": "Cadreur", "niveau_technicien": "Intermédiaire", "niveau_acces": "Membre"},
+            {"nom": "Asony", "prenom": "", "branches": ["Live"], "sous_branche": "Cadreur", "niveau_technicien": "Intermédiaire", "niveau_acces": "Technicien"},
+            {"nom": "Daniel JP", "prenom": "", "branches": ["Live"], "sous_branche": "Cadreur", "niveau_technicien": "Intermédiaire", "niveau_acces": "Technicien"},
+            {"nom": "Frandjy", "prenom": "", "branches": ["Live"], "sous_branche": "Cadreur", "niveau_technicien": "Intermédiaire", "niveau_acces": "Technicien"},
             # Régisseurs
             {"nom": "Christel", "prenom": "", "branches": ["Production"], "sous_branche": None, "niveau_technicien": "Expert", "niveau_acces": "Responsable"},
             {"nom": "Danarocks", "prenom": "", "branches": ["Production"], "sous_branche": None, "niveau_technicien": "Confirmé", "niveau_acces": "Gestionnaire"},
             {"nom": "Nicolas", "prenom": "", "branches": ["Production", "Logistique"], "sous_branche": None, "niveau_technicien": "Confirmé", "niveau_acces": "Gestionnaire"},
-            {"nom": "Elvis", "prenom": "", "branches": ["Production"], "sous_branche": None, "niveau_technicien": "Intermédiaire", "niveau_acces": "Membre"},
-            {"nom": "Emmanuella", "prenom": "", "branches": ["Production"], "sous_branche": None, "niveau_technicien": "Intermédiaire", "niveau_acces": "Membre"},
-            {"nom": "Eloise", "prenom": "", "branches": ["Production"], "sous_branche": None, "niveau_technicien": "Intermédiaire", "niveau_acces": "Membre"},
-            {"nom": "Edese", "prenom": "", "branches": ["Production"], "sous_branche": None, "niveau_technicien": "Intermédiaire", "niveau_acces": "Membre"},
-            {"nom": "Sherley", "prenom": "", "branches": ["Production"], "sous_branche": None, "niveau_technicien": "Intermédiaire", "niveau_acces": "Membre"},
-            {"nom": "Judite", "prenom": "", "branches": ["Production"], "sous_branche": None, "niveau_technicien": "Intermédiaire", "niveau_acces": "Membre"},
+            {"nom": "Elvis", "prenom": "", "branches": ["Production"], "sous_branche": None, "niveau_technicien": "Intermédiaire", "niveau_acces": "Technicien"},
+            {"nom": "Emmanuella", "prenom": "", "branches": ["Production"], "sous_branche": None, "niveau_technicien": "Intermédiaire", "niveau_acces": "Technicien"},
+            {"nom": "Eloise", "prenom": "", "branches": ["Production"], "sous_branche": None, "niveau_technicien": "Intermédiaire", "niveau_acces": "Technicien"},
+            {"nom": "Edese", "prenom": "", "branches": ["Production"], "sous_branche": None, "niveau_technicien": "Intermédiaire", "niveau_acces": "Technicien"},
+            {"nom": "Sherley", "prenom": "", "branches": ["Production"], "sous_branche": None, "niveau_technicien": "Intermédiaire", "niveau_acces": "Technicien"},
+            {"nom": "Judite", "prenom": "", "branches": ["Production"], "sous_branche": None, "niveau_technicien": "Intermédiaire", "niveau_acces": "Technicien"},
             {"nom": "Joanna", "prenom": "", "branches": ["Logistique"], "sous_branche": None, "niveau_technicien": "Expert", "niveau_acces": "Responsable"},
             # Diffusion - Renaud is Responsable de la Diffusion
             {"nom": "Renaud", "prenom": "", "branches": ["Live"], "sous_branche": "Diffusion", "niveau_technicien": "Expert", "niveau_acces": "Responsable"},
             {"nom": "Harvey", "prenom": "", "branches": ["Live"], "sous_branche": "Diffusion", "niveau_technicien": "Confirmé", "niveau_acces": "Gestionnaire"},
             {"nom": "Jean-Remy Victor", "prenom": "", "branches": ["Live"], "sous_branche": "Diffusion", "niveau_technicien": "Confirmé", "niveau_acces": "Gestionnaire"},
-            {"nom": "Cedric", "prenom": "", "branches": ["Live"], "sous_branche": "Diffusion", "niveau_technicien": "Intermédiaire", "niveau_acces": "Membre"},
-            {"nom": "Dierry", "prenom": "", "branches": ["Live"], "sous_branche": "Diffusion", "niveau_technicien": "Intermédiaire", "niveau_acces": "Membre"},
-            {"nom": "Tresor", "prenom": "", "branches": ["Live"], "sous_branche": "Diffusion", "niveau_technicien": "Intermédiaire", "niveau_acces": "Membre"},
-            {"nom": "Michael", "prenom": "", "branches": ["Live"], "sous_branche": "Diffusion", "niveau_technicien": "Intermédiaire", "niveau_acces": "Membre"},
-            {"nom": "Yves", "prenom": "", "branches": ["Live"], "sous_branche": "Diffusion", "niveau_technicien": "Intermédiaire", "niveau_acces": "Membre"},
-            {"nom": "Esdras", "prenom": "", "branches": ["Live"], "sous_branche": "Diffusion", "niveau_technicien": "Intermédiaire", "niveau_acces": "Membre"},
-            {"nom": "Joseph", "prenom": "", "branches": ["Live"], "sous_branche": "Diffusion", "niveau_technicien": "Intermédiaire", "niveau_acces": "Membre"},
+            {"nom": "Cedric", "prenom": "", "branches": ["Live"], "sous_branche": "Diffusion", "niveau_technicien": "Intermédiaire", "niveau_acces": "Technicien"},
+            {"nom": "Dierry", "prenom": "", "branches": ["Live"], "sous_branche": "Diffusion", "niveau_technicien": "Intermédiaire", "niveau_acces": "Technicien"},
+            {"nom": "Tresor", "prenom": "", "branches": ["Live"], "sous_branche": "Diffusion", "niveau_technicien": "Intermédiaire", "niveau_acces": "Technicien"},
+            {"nom": "Michael", "prenom": "", "branches": ["Live"], "sous_branche": "Diffusion", "niveau_technicien": "Intermédiaire", "niveau_acces": "Technicien"},
+            {"nom": "Yves", "prenom": "", "branches": ["Live"], "sous_branche": "Diffusion", "niveau_technicien": "Intermédiaire", "niveau_acces": "Technicien"},
+            {"nom": "Esdras", "prenom": "", "branches": ["Live"], "sous_branche": "Diffusion", "niveau_technicien": "Intermédiaire", "niveau_acces": "Technicien"},
+            {"nom": "Joseph", "prenom": "", "branches": ["Live"], "sous_branche": "Diffusion", "niveau_technicien": "Intermédiaire", "niveau_acces": "Technicien"},
             # Coordination
             {"nom": "Delphine", "prenom": "", "branches": ["Coordination"], "sous_branche": None, "niveau_technicien": "Expert", "niveau_acces": "Responsable"},
             {"nom": "Winchel", "prenom": "", "branches": ["Coordination"], "sous_branche": None, "niveau_technicien": "Expert", "niveau_acces": "Responsable"},
@@ -1167,9 +1180,9 @@ async def seed_data():
             {"nom": "Ryan", "prenom": "", "branches": ["Supervision"], "sous_branche": None, "niveau_technicien": "Expert", "niveau_acces": "Admin"},
             # Additional for FCP/Intercom
             {"nom": "Paul", "prenom": "", "branches": ["Live"], "sous_branche": None, "niveau_technicien": "Confirmé", "niveau_acces": "Gestionnaire"},
-            {"nom": "Tchaba", "prenom": "", "branches": ["Live"], "sous_branche": None, "niveau_technicien": "Intermédiaire", "niveau_acces": "Membre"},
-            {"nom": "Coralie", "prenom": "", "branches": ["Live"], "sous_branche": None, "niveau_technicien": "Intermédiaire", "niveau_acces": "Membre"},
-            {"nom": "Balikissou", "prenom": "", "branches": ["Live"], "sous_branche": None, "niveau_technicien": "Intermédiaire", "niveau_acces": "Membre"},
+            {"nom": "Tchaba", "prenom": "", "branches": ["Live"], "sous_branche": None, "niveau_technicien": "Intermédiaire", "niveau_acces": "Technicien"},
+            {"nom": "Coralie", "prenom": "", "branches": ["Live"], "sous_branche": None, "niveau_technicien": "Intermédiaire", "niveau_acces": "Technicien"},
+            {"nom": "Balikissou", "prenom": "", "branches": ["Live"], "sous_branche": None, "niveau_technicien": "Intermédiaire", "niveau_acces": "Technicien"},
         ]
         
         for t in techniciens_data:
@@ -1523,7 +1536,7 @@ async def register(data: RegisterRequest):
         "username": data.username,
         "password": hash_password(data.password),
         "full_name": full_name,
-        "niveau_acces": "Membre",
+        "niveau_acces": "Technicien",
         "branches": technicien.get("branches", []),
         "technicien_id": technicien["id"],
         "created_at": datetime.now(timezone.utc).isoformat(),
@@ -1592,6 +1605,13 @@ async def get_techniciens(include_archived: bool = False, current_user: dict = D
     techniciens = await db.techniciens.find(query, {"_id": 0}).sort("nom", 1).to_list(1000)
     return [TechnicienResponse(**normalize_technicien(t)) for t in techniciens]
 
+@api_router.get("/techniciens/{tech_id}", response_model=TechnicienResponse)
+async def get_technicien(tech_id: str, current_user: dict = Depends(get_current_user)):
+    tech = await db.techniciens.find_one({"id": tech_id}, {"_id": 0})
+    if not tech:
+        raise HTTPException(status_code=404, detail="Technicien introuvable")
+    return TechnicienResponse(**normalize_technicien(tech))
+
 @api_router.post("/techniciens", response_model=TechnicienResponse)
 async def create_technicien(data: TechnicienCreate, current_user: dict = Depends(get_current_user)):
     await check_access_or_permission(current_user, ["Super Admin", "Admin", "Responsable"], "effectif.write")
@@ -1637,6 +1657,146 @@ async def delete_technicien(tech_id: str, current_user: dict = Depends(get_curre
         raise HTTPException(status_code=404, detail="Technicien non trouvé")
     await log_action(current_user['id'], current_user['full_name'], "Suppression technicien", f"Technicien supprimé: {tech_id}")
     return {"message": "Technicien supprimé"}
+
+# ==================== BADGE (demande / renouvellement) ====================
+# Self-service workflow: a Technicien uploads a clear, face-forward photo
+# (ID-photo style) to request a first badge or renew an existing one.
+# Gestionnaire+ then reviews it from Effectif — confirms receipt/validates,
+# or flags it as non-compliant with a message back to the member. Every new
+# submission raises an in-app notification for Gestionnaire+ (task requested
+# by the Super Admin so nothing gets missed).
+
+BADGE_ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg'}
+
+@api_router.post("/techniciens/{tech_id}/badge")
+async def submit_badge_request(
+    tech_id: str,
+    photo: UploadFile = File(...),
+    current_user: dict = Depends(get_current_user)
+):
+    """Submit a badge request or renewal with a photo. Members may only
+    submit for their own technicien record; Gestionnaire+ may submit on
+    behalf of anyone (e.g. helping someone who can't do it themselves)."""
+    tech = await db.techniciens.find_one({"id": tech_id, "is_archived": False}, {"_id": 0})
+    if not tech:
+        raise HTTPException(status_code=404, detail="Technicien introuvable")
+
+    is_self = current_user.get('technicien_id') == tech_id
+    if not is_self:
+        check_access(current_user, ["Gestionnaire", "Responsable", "Admin", "Super Admin"])
+
+    if not photo.filename or '.' not in photo.filename:
+        raise HTTPException(status_code=400, detail="Aucune photo fournie")
+    ext = photo.filename.rsplit('.', 1)[1].lower()
+    if ext not in BADGE_ALLOWED_EXTENSIONS:
+        raise HTTPException(status_code=400, detail="Format non accepté — utilisez une photo JPG ou PNG")
+
+    contents = await photo.read()
+    if len(contents) > MAX_FILE_SIZE:
+        raise HTTPException(status_code=400, detail="Photo trop volumineuse (max 10 MB)")
+
+    unique_filename = f"{uuid.uuid4()}.{ext}"
+    content_type = 'image/png' if ext == 'png' else 'image/jpeg'
+    await db.files.insert_one({
+        "id": unique_filename,
+        "filename": photo.filename,
+        "content_type": content_type,
+        "data": contents,
+        "size": len(contents),
+        "uploaded_by": current_user['id'],
+        "created_at": datetime.now(timezone.utc).isoformat()
+    })
+    photo_url = f"/api/uploads/{unique_filename}"
+
+    is_renewal = tech.get("badge_attribue", False) is True
+    now = datetime.now(timezone.utc).isoformat()
+    await db.techniciens.update_one({"id": tech_id}, {"$set": {
+        "badge_status": "en_attente_validation",
+        "badge_photo_url": photo_url,
+        "badge_is_renewal": is_renewal,
+        "badge_requested_at": now,
+        "badge_reviewed_at": None,
+        "badge_reviewed_by_name": None,
+        "badge_message": None,
+        "updated_at": now,
+    }})
+
+    label = "Renouvellement de badge" if is_renewal else "Demande de badge"
+    await log_action(current_user['id'], current_user['full_name'], label, f"{tech.get('nom')}")
+
+    recipient_ids = await get_user_ids_by_roles(["Gestionnaire", "Responsable", "Admin", "Super Admin"])
+    await create_notification(
+        recipient_ids, "badge",
+        label,
+        f"{tech.get('nom')} a soumis une photo pour son badge.",
+        link="/effectif"
+    )
+    return {"message": "Demande envoyée", "badge_status": "en_attente_validation", "badge_photo_url": photo_url}
+
+@api_router.get("/admin/badges", response_model=List[TechnicienResponse])
+async def list_badge_requests(current_user: dict = Depends(get_current_user)):
+    check_access(current_user, ["Gestionnaire", "Responsable", "Admin", "Super Admin"])
+    techniciens = await db.techniciens.find(
+        {"badge_status": {"$ne": None}, "is_archived": False}, {"_id": 0}
+    ).sort("badge_requested_at", -1).to_list(1000)
+    return [TechnicienResponse(**normalize_technicien(t)) for t in techniciens]
+
+@api_router.post("/admin/badges/{tech_id}/confirm")
+async def confirm_badge(tech_id: str, current_user: dict = Depends(get_current_user)):
+    """Marks the badge as validated/issued. Also flips badge_attribue to True
+    since a validated badge implies it has now been handed out."""
+    check_access(current_user, ["Gestionnaire", "Responsable", "Admin", "Super Admin"])
+    tech = await db.techniciens.find_one({"id": tech_id}, {"_id": 0})
+    if not tech:
+        raise HTTPException(status_code=404, detail="Technicien introuvable")
+    now = datetime.now(timezone.utc).isoformat()
+    await db.techniciens.update_one({"id": tech_id}, {"$set": {
+        "badge_status": "validee",
+        "badge_attribue": True,
+        "badge_reviewed_at": now,
+        "badge_reviewed_by_name": current_user['full_name'],
+        "badge_message": None,
+        "updated_at": now,
+    }})
+    await log_action(current_user['id'], current_user['full_name'], "Validation badge", f"{tech.get('nom')}")
+
+    user_doc = await db.users.find_one({"technicien_id": tech_id}, {"_id": 0, "id": 1})
+    if user_doc:
+        await create_notification(
+            [user_doc["id"]], "badge",
+            "Badge validé",
+            "Votre badge a été validé.",
+            link="/mon-espace"
+        )
+    return {"message": "Badge validé"}
+
+@api_router.post("/admin/badges/{tech_id}/reject")
+async def reject_badge(tech_id: str, data: BadgeRejectRequest, current_user: dict = Depends(get_current_user)):
+    """Flags the submitted photo as non-compliant, with a message explaining
+    why, sent back to the member so they can resubmit."""
+    check_access(current_user, ["Gestionnaire", "Responsable", "Admin", "Super Admin"])
+    tech = await db.techniciens.find_one({"id": tech_id}, {"_id": 0})
+    if not tech:
+        raise HTTPException(status_code=404, detail="Technicien introuvable")
+    now = datetime.now(timezone.utc).isoformat()
+    await db.techniciens.update_one({"id": tech_id}, {"$set": {
+        "badge_status": "non_conforme",
+        "badge_reviewed_at": now,
+        "badge_reviewed_by_name": current_user['full_name'],
+        "badge_message": data.message,
+        "updated_at": now,
+    }})
+    await log_action(current_user['id'], current_user['full_name'], "Photo badge refusée", f"{tech.get('nom')}: {data.message}")
+
+    user_doc = await db.users.find_one({"technicien_id": tech_id}, {"_id": 0, "id": 1})
+    if user_doc:
+        await create_notification(
+            [user_doc["id"]], "badge",
+            "Photo de badge non conforme",
+            data.message,
+            link="/mon-espace"
+        )
+    return {"message": "Photo signalée comme non conforme"}
 
 # ==================== MATERIEL ROUTES ====================
 
@@ -1984,7 +2144,7 @@ async def create_formation(data: FormationCreate, current_user: dict = Depends(g
         "is_archived": False,
         "archived_at": None,
         "disponible_catalogue": False,
-        "origine": "demande_membre" if current_user['niveau_acces'] == 'Membre' else "proposition_responsable"
+        "origine": "demande_membre" if current_user['niveau_acces'] == 'Technicien' else "proposition_responsable"
     }
     await db.formations.insert_one(formation)
     await log_action(current_user['id'], current_user['full_name'], "Demande formation", f"Formation demandée: {data.titre}")
@@ -2898,18 +3058,209 @@ async def get_system_status(current_user: dict = Depends(get_current_user)):
 
     uptime_seconds = time.time() - SERVER_START_TIME
 
+    # Storage quota is admin-configured rather than fetched from an
+    # infrastructure API (Railway's MongoDB volumes are billed by usage, not
+    # a small fixed quota like a free Atlas cluster, so there's no single
+    # "plan limit" number to query). Setting one here is what unlocks a
+    # genuine "used / remaining" picture instead of raw bytes alone.
+    quota_doc = await db.settings.find_one({"_key": "storage_quota"})
+    quota_bytes = (quota_doc or {}).get("quota_bytes")
+    storage_size = db_stats.get("storageSize", 0)
+    remaining_bytes = (quota_bytes - storage_size) if quota_bytes else None
+    percent_used = round((storage_size / quota_bytes) * 100, 1) if quota_bytes else None
+
+    last_logs_purge_doc = await db.settings.find_one({"_key": "last_logs_purge"})
+
     return {
         "mongo_connected": mongo_ok,
         "mongo_error": mongo_error,
         "db_data_size_bytes": db_stats.get("dataSize", 0),
-        "db_storage_size_bytes": db_stats.get("storageSize", 0),
+        "db_storage_size_bytes": storage_size,
         "db_index_size_bytes": db_stats.get("indexSize", 0),
         "db_collections_count": db_stats.get("collections", 0),
         "db_objects_count": db_stats.get("objects", 0),
         "collections": collections_info,
         "backend_uptime_seconds": uptime_seconds,
         "server_time": datetime.now(timezone.utc).isoformat(),
+        "quota_bytes": quota_bytes,
+        "remaining_bytes": remaining_bytes,
+        "percent_used": percent_used,
+        "last_logs_purge": (last_logs_purge_doc or {}).get("month"),
     }
+
+class StorageQuotaUpdate(BaseModel):
+    quota_gb: float  # 0 or omitted clears the quota (back to "no quota set")
+
+@api_router.put("/admin/storage-quota")
+async def set_storage_quota(data: StorageQuotaUpdate, current_user: dict = Depends(get_current_user)):
+    check_access(current_user, ["Super Admin"])
+    quota_bytes = int(data.quota_gb * 1024 * 1024 * 1024) if data.quota_gb and data.quota_gb > 0 else None
+    await db.settings.update_one(
+        {"_key": "storage_quota"},
+        {"$set": {"_key": "storage_quota", "quota_bytes": quota_bytes}},
+        upsert=True
+    )
+    await log_action(current_user['id'], current_user['full_name'], "Modification quota stockage",
+                      f"{data.quota_gb} Go" if quota_bytes else "Quota retiré")
+    return {"quota_bytes": quota_bytes}
+
+# ---- Nettoyage : fichiers orphelins ----
+# Un fichier uploadé (collection `files`, servi via GET /api/uploads/{id})
+# n'est référencé que depuis deux endroits : actualites.image_url et
+# documents.file_url. Un fichier dont l'id n'apparaît dans aucun des deux
+# est "orphelin" (remplacé par un autre, ou son actualité/document parent a
+# été supprimé) — il n'est plus utilisé nulle part mais continue à occuper
+# de la place. Preview (GET) avant suppression (POST) par sécurité : on ne
+# supprime jamais sans confirmation explicite.
+async def _find_orphaned_file_ids() -> List[str]:
+    referenced_ids = set()
+    async for a in db.actualites.find({"image_url": {"$exists": True, "$ne": None}}, {"_id": 0, "image_url": 1}):
+        url = a.get("image_url") or ""
+        if "/api/uploads/" in url:
+            referenced_ids.add(url.rsplit("/", 1)[-1])
+    async for d in db.documents.find({"file_url": {"$exists": True, "$ne": None}}, {"_id": 0, "file_url": 1}):
+        url = d.get("file_url") or ""
+        if "/api/uploads/" in url:
+            referenced_ids.add(url.rsplit("/", 1)[-1])
+
+    orphaned = []
+    async for f in db.files.find({}, {"_id": 0, "id": 1}):
+        if f["id"] not in referenced_ids:
+            orphaned.append(f["id"])
+    return orphaned
+
+@api_router.get("/admin/cleanup/orphaned-files")
+async def preview_orphaned_files(current_user: dict = Depends(get_current_user)):
+    check_access(current_user, ["Super Admin"])
+    orphaned_ids = await _find_orphaned_file_ids()
+    total_bytes = 0
+    if orphaned_ids:
+        async for f in db.files.find({"id": {"$in": orphaned_ids}}, {"_id": 0, "size": 1}):
+            total_bytes += f.get("size", 0)
+    return {"count": len(orphaned_ids), "total_bytes": total_bytes}
+
+@api_router.post("/admin/cleanup/orphaned-files")
+async def cleanup_orphaned_files(current_user: dict = Depends(get_current_user)):
+    check_access(current_user, ["Super Admin"])
+    orphaned_ids = await _find_orphaned_file_ids()
+    deleted_count = 0
+    if orphaned_ids:
+        result = await db.files.delete_many({"id": {"$in": orphaned_ids}})
+        deleted_count = result.deleted_count
+    await log_action(current_user['id'], current_user['full_name'], "Nettoyage fichiers orphelins",
+                      f"{deleted_count} fichier(s) supprimé(s)")
+    return {"deleted_count": deleted_count}
+
+# ---- Nettoyage : logs d'activité ----
+# Purge automatique déjà en place au démarrage (politique RGPD 12 mois) —
+# ceci ajoute un déclenchement manuel à la demande, et une vérification en
+# tâche de fond qui tourne même si le serveur reste actif plusieurs mois
+# sans redémarrer (sinon la purge "au démarrage" ne se représenterait
+# jamais). last_logs_purge (settings) retient le mois (YYYY-MM) du dernier
+# passage pour ne le faire qu'une fois par mois civil.
+async def _purge_old_logs() -> int:
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=365)).isoformat()
+    result = await db.logs.delete_many({"timestamp": {"$lt": cutoff}})
+    current_month = datetime.now(timezone.utc).strftime("%Y-%m")
+    await db.settings.update_one(
+        {"_key": "last_logs_purge"},
+        {"$set": {"_key": "last_logs_purge", "month": current_month}},
+        upsert=True
+    )
+    return result.deleted_count
+
+@api_router.post("/admin/cleanup/logs")
+async def cleanup_logs_now(current_user: dict = Depends(get_current_user)):
+    check_access(current_user, ["Super Admin"])
+    deleted_count = await _purge_old_logs()
+    await log_action(current_user['id'], current_user['full_name'], "Nettoyage manuel des logs",
+                      f"{deleted_count} log(s) de plus de 12 mois supprimé(s)")
+    return {"deleted_count": deleted_count}
+
+async def monthly_logs_purge_task():
+    """Runs once a day; actually purges only the first time it notices a
+    new calendar month, so it self-corrects even after long uptimes."""
+    while True:
+        try:
+            current_month = datetime.now(timezone.utc).strftime("%Y-%m")
+            doc = await db.settings.find_one({"_key": "last_logs_purge"})
+            if not doc or doc.get("month") != current_month:
+                deleted_count = await _purge_old_logs()
+                logger.info(f"Purge mensuelle automatique des logs : {deleted_count} supprimé(s)")
+        except Exception as e:
+            logger.error(f"Purge mensuelle des logs échouée: {e}")
+        await asyncio.sleep(6 * 60 * 60)  # re-check every 6h
+
+# ---- Redémarrage du serveur ----
+# Le process se termine lui-même (os._exit) ; Railway relance automatiquement
+# tout service dont le process s'arrête de façon inattendue (politique de
+# redémarrage par défaut), ce qui a le même effet qu'un vrai "redémarrer" —
+# au prix d'une coupure de 30 à 60 secondes le temps que le nouveau
+# conteneur démarre. La réponse HTTP est renvoyée avant l'arrêt effectif
+# (délai court en tâche de fond) pour que le bouton ne reste pas bloqué.
+@api_router.post("/admin/restart-server")
+async def restart_server(current_user: dict = Depends(get_current_user)):
+    check_access(current_user, ["Super Admin"])
+    await log_action(current_user['id'], current_user['full_name'], "Redémarrage serveur demandé", "")
+
+    async def _delayed_exit():
+        await asyncio.sleep(1.5)
+        os._exit(0)
+
+    asyncio.create_task(_delayed_exit())
+    return {"message": "Redémarrage en cours — le serveur sera de nouveau disponible dans environ une minute."}
+
+# ---- Export de données ----
+# CSV et JSON (aucune dépendance supplémentaire à installer) sur les
+# collections listées dans SUPERVISED_COLLECTIONS uniquement — jamais de
+# collection arbitraire par nom, pour éviter d'exposer accidentellement
+# quelque chose de sensible qui serait ajouté plus tard sans y penser ici.
+@api_router.get("/admin/export/{collection_name}")
+async def export_collection(collection_name: str, format: str = "json", current_user: dict = Depends(get_current_user)):
+    check_access(current_user, ["Super Admin"])
+    if collection_name not in SUPERVISED_COLLECTIONS:
+        raise HTTPException(status_code=404, detail="Catégorie inconnue")
+    if format not in ("json", "csv"):
+        raise HTTPException(status_code=400, detail="Format non supporté (json ou csv)")
+
+    docs = await getattr(db, collection_name).find({}, {"_id": 0, "data": 0}).to_list(10000)
+    await log_action(current_user['id'], current_user['full_name'], "Export de données",
+                      f"{collection_name} ({format}, {len(docs)} élément(s))")
+
+    if format == "json":
+        content = json.dumps(docs, indent=2, ensure_ascii=False, default=str)
+        return Response(
+            content=content,
+            media_type="application/json",
+            headers={"Content-Disposition": f'attachment; filename="{collection_name}.json"'}
+        )
+
+    # CSV: union of every key seen across all docs, so no row is truncated
+    # just because an earlier doc happened to be missing a field. Nested
+    # values (lists/dicts) are serialized as a JSON string within the cell
+    # rather than crashing or being silently dropped.
+    import csv
+    import io
+    fieldnames = []
+    seen = set()
+    for d in docs:
+        for k in d.keys():
+            if k not in seen:
+                seen.add(k)
+                fieldnames.append(k)
+    output = io.StringIO()
+    writer = csv.DictWriter(output, fieldnames=fieldnames, extrasaction="ignore")
+    writer.writeheader()
+    for d in docs:
+        row = {}
+        for k, v in d.items():
+            row[k] = json.dumps(v, ensure_ascii=False, default=str) if isinstance(v, (list, dict)) else v
+        writer.writerow(row)
+    return Response(
+        content=output.getvalue(),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{collection_name}.csv"'}
+    )
 
 # ==================== ENUMS ENDPOINTS ====================
 
@@ -3757,6 +4108,7 @@ async def update_maintenance_mode(data: MaintenanceModeUpdate, current_user: dic
 async def startup():
     await seed_data()
     asyncio.create_task(purge_old_archived_formations())
+    asyncio.create_task(monthly_logs_purge_task())
     # Create indexes for better query performance
     try:
         await db.planning.create_index([("annee", 1), ("mois", 1)], unique=True)
@@ -3779,12 +4131,25 @@ async def startup():
     except Exception as e:
         logger.warning(f"sous_branche migration skipped: {e}")
 
-    # RGPD: purge activity logs older than 12 months (data retention policy)
+    # One-off migration: role label "Membre" was renamed to "Technicien"
+    # (same permissions, just a clearer name). Existing users/techniciens
+    # records created before the rename still say "Membre" — flip them over.
+    # Safe to run on every boot (no-op once migrated).
     try:
-        cutoff = (datetime.now(timezone.utc) - timedelta(days=365)).isoformat()
-        result = await db.logs.delete_many({"timestamp": {"$lt": cutoff}})
-        if result.deleted_count:
-            logger.info(f"RGPD: {result.deleted_count} logs de plus de 12 mois purgés")
+        r1 = await db.users.update_many({"niveau_acces": "Membre"}, {"$set": {"niveau_acces": "Technicien"}})
+        r2 = await db.techniciens.update_many({"niveau_acces": "Membre"}, {"$set": {"niveau_acces": "Technicien"}})
+        if r1.modified_count or r2.modified_count:
+            logger.info(f"Migration rôle Membre->Technicien: {r1.modified_count} users, {r2.modified_count} techniciens")
+    except Exception as e:
+        logger.warning(f"Membre->Technicien migration skipped: {e}")
+
+    # RGPD: purge activity logs older than 12 months (data retention policy).
+    # Shares the same helper as the manual "Nettoyer maintenant" button and
+    # the monthly background re-check, so all three stay in sync.
+    try:
+        deleted_count = await _purge_old_logs()
+        if deleted_count:
+            logger.info(f"RGPD: {deleted_count} logs de plus de 12 mois purgés")
     except Exception as e:
         logger.warning(f"Log retention purge skipped: {e}")
 
