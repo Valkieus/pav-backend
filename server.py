@@ -325,6 +325,8 @@ class FormationSuggestionResponse(BaseModel):
     created_by_name: str
     created_at: str
     resulting_formation_id: Optional[str] = None
+    is_archived: bool = False
+    archived_at: Optional[str] = None
 
 # Actualités models
 class ActualiteCreate(BaseModel):
@@ -2029,6 +2031,8 @@ async def create_formation_suggestion(data: FormationSuggestionCreate, current_u
         "created_by_name": current_user['full_name'],
         "created_at": datetime.now(timezone.utc).isoformat(),
         "resulting_formation_id": None,
+        "is_archived": False,
+        "archived_at": None,
     }
     await db.formation_suggestions.insert_one(suggestion)
     await log_action(current_user['id'], current_user['full_name'], "Suggestion formation", f"Suggestion: {data.titre}")
@@ -2042,15 +2046,48 @@ async def create_formation_suggestion(data: FormationSuggestionCreate, current_u
     return FormationSuggestionResponse(**suggestion)
 
 @api_router.get("/formation-suggestions", response_model=List[FormationSuggestionResponse])
-async def get_formation_suggestions(current_user: dict = Depends(get_current_user)):
+async def get_formation_suggestions(include_archived: bool = False, current_user: dict = Depends(get_current_user)):
     check_access(current_user, ["Super Admin", "Admin", "Responsable", "Gestionnaire"])
-    suggestions = await db.formation_suggestions.find({}, {"_id": 0}).sort("created_at", -1).to_list(1000)
+    query = {} if include_archived else {"is_archived": {"$ne": True}}
+    suggestions = await db.formation_suggestions.find(query, {"_id": 0}).sort("created_at", -1).to_list(1000)
     return [FormationSuggestionResponse(**s) for s in suggestions]
 
 @api_router.get("/formation-suggestions/mine", response_model=List[FormationSuggestionResponse])
-async def get_my_formation_suggestions(current_user: dict = Depends(get_current_user)):
-    suggestions = await db.formation_suggestions.find({"created_by": current_user['id']}, {"_id": 0}).sort("created_at", -1).to_list(1000)
+async def get_my_formation_suggestions(include_archived: bool = False, current_user: dict = Depends(get_current_user)):
+    query = {"created_by": current_user['id']}
+    if not include_archived:
+        query["is_archived"] = {"$ne": True}
+    suggestions = await db.formation_suggestions.find(query, {"_id": 0}).sort("created_at", -1).to_list(1000)
     return [FormationSuggestionResponse(**s) for s in suggestions]
+
+@api_router.put("/formation-suggestions/{suggestion_id}/archive")
+async def archive_formation_suggestion(suggestion_id: str, current_user: dict = Depends(get_current_user)):
+    """A suggestion's creator or Coordination/Admin can archive it — keeps
+    the Suggestions tab tidy without permanently deleting the record.
+    Archived suggestions are purged after 6 months, same as formations."""
+    suggestion = await db.formation_suggestions.find_one({"id": suggestion_id}, {"_id": 0})
+    if not suggestion:
+        raise HTTPException(status_code=404, detail="Suggestion non trouvée")
+    if suggestion['created_by'] != current_user['id'] and not is_coordination_or_admin(current_user):
+        raise HTTPException(status_code=403, detail="Non autorisé")
+    await db.formation_suggestions.update_one(
+        {"id": suggestion_id},
+        {"$set": {"is_archived": True, "archived_at": datetime.now(timezone.utc).isoformat()}}
+    )
+    await log_action(current_user['id'], current_user['full_name'], "Archivage suggestion formation", f"Suggestion archivée: {suggestion.get('titre')}")
+    return {"message": "Suggestion archivée"}
+
+@api_router.put("/formation-suggestions/{suggestion_id}/unarchive")
+async def unarchive_formation_suggestion(suggestion_id: str, current_user: dict = Depends(get_current_user)):
+    check_access(current_user, ["Super Admin", "Admin", "Responsable", "Gestionnaire"])
+    result = await db.formation_suggestions.update_one(
+        {"id": suggestion_id},
+        {"$set": {"is_archived": False, "archived_at": None}}
+    )
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Suggestion non trouvée")
+    await log_action(current_user['id'], current_user['full_name'], "Désarchivage suggestion formation", suggestion_id)
+    return {"message": "Suggestion désarchivée"}
 
 @api_router.delete("/formation-suggestions/{suggestion_id}")
 async def withdraw_formation_suggestion(suggestion_id: str, current_user: dict = Depends(get_current_user)):
@@ -2136,14 +2173,15 @@ async def archive_formation(formation_id: str, current_user: dict = Depends(get_
     return {"message": "Formation archivée"}
 
 async def purge_old_archived_formations():
-    """Archived formations are kept 6 months for reference, then purged.
-    Runs once at startup and then every 24h in the background."""
+    """Archived formations and formation suggestions are kept 6 months for
+    reference, then purged. Runs once at startup and then every 24h."""
     while True:
         try:
             cutoff = (datetime.now(timezone.utc) - timedelta(days=180)).isoformat()
             await db.formations.delete_many({"is_archived": True, "archived_at": {"$lt": cutoff}})
+            await db.formation_suggestions.delete_many({"is_archived": True, "archived_at": {"$lt": cutoff}})
         except Exception as e:
-            logger.error(f"Purge formations archivées échouée: {e}")
+            logger.error(f"Purge formations/suggestions archivées échouée: {e}")
         await asyncio.sleep(24 * 60 * 60)
 
 @api_router.delete("/formations/{formation_id}")
@@ -2520,6 +2558,110 @@ async def get_dashboard_stats(current_user: dict = Depends(get_current_user)):
         "total_salles": total_salles,
         "reservations_en_attente": reservations_en_attente,
         "reservations_validees": reservations_validees
+    }
+
+# ==================== DASHBOARD MEMBER BRIEF ====================
+
+DEFAULT_SERVICE_INFO_TEXT = "Arrivée 30 minutes avant le début du service — vendredi 18h30, dimanche 8h30."
+
+async def get_service_info_text() -> str:
+    """Short reminder of service hours shown on every Dashboard, editable at
+    runtime by Admin/Super Admin — same settings-doc pattern as postes."""
+    doc = await db.settings.find_one({"_key": "service_info_text"})
+    if not doc:
+        await db.settings.update_one(
+            {"_key": "service_info_text"},
+            {"$set": {"_key": "service_info_text", "text": DEFAULT_SERVICE_INFO_TEXT}},
+            upsert=True
+        )
+        return DEFAULT_SERVICE_INFO_TEXT
+    return doc.get("text", DEFAULT_SERVICE_INFO_TEXT)
+
+class ServiceInfoUpdate(BaseModel):
+    text: str
+
+@api_router.put("/dashboard/service-info")
+async def update_service_info_text(data: ServiceInfoUpdate, current_user: dict = Depends(get_current_user)):
+    check_access(current_user, ["Super Admin", "Admin", "Responsable"])
+    text = data.text.strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Le texte ne peut pas être vide")
+    await db.settings.update_one({"_key": "service_info_text"}, {"$set": {"text": text}}, upsert=True)
+    await log_action(current_user['id'], current_user['full_name'], "Modification rappel horaires", text)
+    return {"status": "success", "service_info_text": text}
+
+@api_router.get("/dashboard/member-brief")
+async def get_member_brief(current_user: dict = Depends(get_current_user)):
+    """Personalized quick-info summary shown at the top of everyone's
+    Dashboard (Membre included): next upcoming service date(s) found by
+    matching the user's name in this month's/next month's Planning, upcoming
+    Actualités events, how many formations are open in the catalogue, and a
+    short admin-editable reminder of service hours."""
+    now = datetime.now(timezone.utc)
+    today_str = now.strftime('%Y-%m-%d')
+    target_name = (current_user.get('full_name') or '').strip().lower()
+
+    def _name_matches(value) -> bool:
+        if not target_name or not value or not isinstance(value, str):
+            return False
+        v = value.strip().lower()
+        if not v:
+            return False
+        return v == target_name or v in target_name or target_name in v
+
+    months_to_check = [(now.year, now.month)]
+    next_month, next_year = now.month + 1, now.year
+    if next_month > 12:
+        next_month, next_year = 1, next_year + 1
+    months_to_check.append((next_year, next_month))
+
+    upcoming_shifts = []
+    for (yr, mo) in months_to_check:
+        planning = await db.planning.find_one({"annee": yr, "mois": mo, "is_archived": False}, {"_id": 0})
+        if not planning:
+            continue
+        dates = planning.get('dates') or {}
+        affectations = planning.get('affectations') or {}
+        for day_type in ['vendredi', 'dimanche']:
+            day_dates = dates.get(day_type) or []
+            if not day_dates:
+                continue
+            for values in affectations.values():
+                if not values:
+                    continue
+                items = enumerate(values) if isinstance(values, list) else values.items()
+                for idx_key, value in items:
+                    try:
+                        idx = int(idx_key)
+                    except (TypeError, ValueError):
+                        continue
+                    if idx < 0 or idx >= len(day_dates) or not _name_matches(value):
+                        continue
+                    date_str = day_dates[idx]
+                    if date_str >= today_str:
+                        upcoming_shifts.append({"date": date_str, "jour": day_type})
+
+    seen, deduped_shifts = set(), []
+    for s in sorted(upcoming_shifts, key=lambda x: x['date']):
+        if s['date'] in seen:
+            continue
+        seen.add(s['date'])
+        deduped_shifts.append(s)
+    upcoming_shifts = deduped_shifts[:4]
+
+    actualites = await db.actualites.find({"is_active": True}, {"_id": 0}).to_list(200)
+    upcoming_events = sorted(
+        [a for a in actualites if a.get('date_evenement') and a['date_evenement'] >= today_str],
+        key=lambda a: a['date_evenement']
+    )[:3]
+
+    formations_catalogue_count = await db.formations.count_documents({"is_archived": False, "disponible_catalogue": True})
+
+    return {
+        "upcoming_shifts": upcoming_shifts,
+        "upcoming_events": [{"titre": e['titre'], "date_evenement": e['date_evenement']} for e in upcoming_events],
+        "formations_catalogue_count": formations_catalogue_count,
+        "service_info_text": await get_service_info_text(),
     }
 
 # ==================== ORGANIGRAMME ====================
