@@ -717,6 +717,120 @@ async def check_access_or_permission(user: dict, required_levels: List[str], per
         return
     raise HTTPException(status_code=403, detail="Accès non autorisé")
 
+# ==================== MATRICE DES DROITS PAR RÔLE ====================
+# Configurable depuis Administration > Droits d'accès. Chaque entrée décrit
+# un droit précis et, pour chacun des 3 rôles configurables, s'il est déjà
+# "de base" (verrouillé, non modifiable ici) ou librement activable/
+# désactivable par un Super Admin. Le rôle Super Admin a toujours tous les
+# droits et n'apparaît pas comme colonne éditable.
+CONFIGURABLE_ROLES = ["Responsable", "Gestionnaire", "Admin"]
+
+PERMISSION_CATALOG = [
+    {
+        "key": "actualites.write",
+        "label": "Publier / modifier des actualités",
+        "baseline": ["Gestionnaire", "Responsable"],
+        "admin_bypass": True,
+    },
+    {
+        "key": "documents.write",
+        "label": "Ajouter / modifier des documents (base de connaissance)",
+        "baseline": ["Gestionnaire", "Responsable"],
+        "admin_bypass": True,
+    },
+    {
+        "key": "admin.restart",
+        "label": "Redémarrer le serveur",
+        "baseline": [],
+        "admin_bypass": False,
+    },
+    {
+        "key": "admin.cleanup",
+        "label": "Nettoyer les fichiers orphelins / purger les logs",
+        "baseline": [],
+        "admin_bypass": False,
+    },
+    {
+        "key": "admin.storage_quota",
+        "label": "Modifier le quota de stockage",
+        "baseline": [],
+        "admin_bypass": False,
+    },
+    {
+        "key": "admin.maintenance",
+        "label": "Activer / désactiver le mode maintenance",
+        "baseline": [],
+        "admin_bypass": False,
+    },
+]
+_PERMISSION_CATALOG_BY_KEY = {e["key"]: e for e in PERMISSION_CATALOG}
+
+async def role_has_permission(role: str, permission: str) -> bool:
+    """Explicit grant made via Administration > Droits d'accès for a role
+    that is neither baseline nor admin-bypassed for this permission."""
+    doc = await db.role_permissions.find_one({"role": role, "permission": permission}, {"_id": 0})
+    return doc is not None
+
+async def check_access_or_role_permission(user: dict, required_levels: List[str], permission: str):
+    """Strict role check (no Admin bypass), OR'd with an explicit grant from
+    the role-permissions matrix. Used for sensitive Supervision/Maintenance
+    actions where Admin must NOT have access unless a Super Admin explicitly
+    ticks the box in Administration > Droits d'accès."""
+    if user['niveau_acces'] in required_levels:
+        return
+    if await role_has_permission(user['niveau_acces'], permission):
+        return
+    raise HTTPException(status_code=403, detail="Accès non autorisé")
+
+class RolePermissionUpdate(BaseModel):
+    role: str
+    permission: str
+    granted: bool
+
+@api_router.get("/admin/role-permissions")
+async def get_role_permissions_matrix(current_user: dict = Depends(get_current_user)):
+    check_access(current_user, ["Super Admin"])
+    docs = await db.role_permissions.find({}, {"_id": 0}).to_list(1000)
+    grants: dict = {}
+    for d in docs:
+        grants.setdefault(d['role'], set()).add(d['permission'])
+    rows = []
+    for entry in PERMISSION_CATALOG:
+        row = {"key": entry["key"], "label": entry["label"], "roles": {}}
+        for role in CONFIGURABLE_ROLES:
+            if role in entry["baseline"]:
+                row["roles"][role] = {"granted": True, "locked": True, "reason": "Droit de base du rôle"}
+            elif role == "Admin" and entry["admin_bypass"]:
+                row["roles"][role] = {"granted": True, "locked": True, "reason": "Admin a accès à tout sauf les actions verrouillées Super Admin"}
+            else:
+                row["roles"][role] = {"granted": entry["key"] in grants.get(role, set()), "locked": False, "reason": None}
+        rows.append(row)
+    return {"rows": rows}
+
+@api_router.put("/admin/role-permissions")
+async def update_role_permission(data: RolePermissionUpdate, current_user: dict = Depends(get_current_user)):
+    check_access(current_user, ["Super Admin"])
+    if data.role not in CONFIGURABLE_ROLES:
+        raise HTTPException(status_code=400, detail="Rôle invalide")
+    entry = _PERMISSION_CATALOG_BY_KEY.get(data.permission)
+    if not entry:
+        raise HTTPException(status_code=404, detail="Droit inconnu")
+    if data.role in entry["baseline"] or (data.role == "Admin" and entry["admin_bypass"]):
+        raise HTTPException(status_code=400, detail="Ce droit est déjà accordé de base à ce rôle et ne peut pas être modifié ici")
+    if data.granted:
+        await db.role_permissions.update_one(
+            {"role": data.role, "permission": data.permission},
+            {"$set": {"role": data.role, "permission": data.permission}},
+            upsert=True,
+        )
+    else:
+        await db.role_permissions.delete_one({"role": data.role, "permission": data.permission})
+    await log_action(
+        current_user['id'], current_user['full_name'], "Modification droits d'accès",
+        f"{data.role} / {entry['label']} -> {'accordé' if data.granted else 'retiré'}"
+    )
+    return {"message": "Droit mis à jour"}
+
 def is_coordination_or_admin(user: dict) -> bool:
     """Coordination step of the Formations workflow: Gestionnaire+ in the
     Coordination branch, or Admin/Super Admin (who retain full visibility)."""
@@ -2874,7 +2988,7 @@ async def get_actualites_public():
 
 @api_router.post("/actualites", response_model=ActualiteResponse)
 async def create_actualite(data: ActualiteCreate, current_user: dict = Depends(get_current_user)):
-    check_access(current_user, ["Super Admin", "Responsable", "Gestionnaire"])
+    await check_access_or_permission(current_user, ["Super Admin", "Responsable", "Gestionnaire"], "actualites.write")
     actualite = {
         "id": str(uuid.uuid4()),
         "titre": data.titre,
@@ -2892,7 +3006,7 @@ async def create_actualite(data: ActualiteCreate, current_user: dict = Depends(g
 
 @api_router.put("/actualites/{actualite_id}", response_model=ActualiteResponse)
 async def update_actualite(actualite_id: str, data: ActualiteCreate, current_user: dict = Depends(get_current_user)):
-    check_access(current_user, ["Super Admin", "Responsable", "Gestionnaire"])
+    await check_access_or_permission(current_user, ["Super Admin", "Responsable", "Gestionnaire"], "actualites.write")
     update_data = {
         "titre": data.titre,
         "description": data.description,
@@ -2978,7 +3092,7 @@ async def get_documents(current_user: dict = Depends(get_current_user)):
 
 @api_router.post("/documents", response_model=DocumentResponse)
 async def create_document(data: DocumentCreate, current_user: dict = Depends(get_current_user)):
-    check_access(current_user, ["Super Admin", "Responsable", "Gestionnaire"])
+    await check_access_or_permission(current_user, ["Super Admin", "Responsable", "Gestionnaire"], "documents.write")
     # Get category name
     category = await db.document_categories.find_one({"id": data.categorie_id}, {"_id": 0})
     categorie_nom = category['nom'] if category else 'Sans catégorie'
@@ -3002,7 +3116,7 @@ async def create_document(data: DocumentCreate, current_user: dict = Depends(get
 
 @api_router.put("/documents/{document_id}", response_model=DocumentResponse)
 async def update_document(document_id: str, data: DocumentCreate, current_user: dict = Depends(get_current_user)):
-    check_access(current_user, ["Super Admin", "Responsable", "Gestionnaire"])
+    await check_access_or_permission(current_user, ["Super Admin", "Responsable", "Gestionnaire"], "documents.write")
     category = await db.document_categories.find_one({"id": data.categorie_id}, {"_id": 0})
     categorie_nom = category['nom'] if category else 'Sans catégorie'
 
@@ -3294,7 +3408,7 @@ class StorageQuotaUpdate(BaseModel):
 
 @api_router.put("/admin/storage-quota")
 async def set_storage_quota(data: StorageQuotaUpdate, current_user: dict = Depends(get_current_user)):
-    check_access(current_user, ["Super Admin"])
+    await check_access_or_role_permission(current_user, ["Super Admin"], "admin.storage_quota")
     quota_bytes = int(data.quota_gb * 1024 * 1024 * 1024) if data.quota_gb and data.quota_gb > 0 else None
     await db.settings.update_one(
         {"_key": "storage_quota"},
@@ -3342,7 +3456,7 @@ async def preview_orphaned_files(current_user: dict = Depends(get_current_user))
 
 @api_router.post("/admin/cleanup/orphaned-files")
 async def cleanup_orphaned_files(current_user: dict = Depends(get_current_user)):
-    check_access(current_user, ["Super Admin"])
+    await check_access_or_role_permission(current_user, ["Super Admin"], "admin.cleanup")
     orphaned_ids = await _find_orphaned_file_ids()
     deleted_count = 0
     if orphaned_ids:
@@ -3372,7 +3486,7 @@ async def _purge_old_logs() -> int:
 
 @api_router.post("/admin/cleanup/logs")
 async def cleanup_logs_now(current_user: dict = Depends(get_current_user)):
-    check_access(current_user, ["Super Admin"])
+    await check_access_or_role_permission(current_user, ["Super Admin"], "admin.cleanup")
     deleted_count = await _purge_old_logs()
     await log_action(current_user['id'], current_user['full_name'], "Nettoyage manuel des logs",
                       f"{deleted_count} log(s) de plus de 12 mois supprimé(s)")
@@ -3401,7 +3515,7 @@ async def monthly_logs_purge_task():
 # (délai court en tâche de fond) pour que le bouton ne reste pas bloqué.
 @api_router.post("/admin/restart-server")
 async def restart_server(current_user: dict = Depends(get_current_user)):
-    check_access(current_user, ["Super Admin"])
+    await check_access_or_role_permission(current_user, ["Super Admin"], "admin.restart")
     await log_action(current_user['id'], current_user['full_name'], "Redémarrage serveur demandé", "")
 
     async def _delayed_exit():
@@ -4279,8 +4393,9 @@ async def get_maintenance_mode():
 
 @api_router.put("/maintenance", response_model=MaintenanceModeResponse)
 async def update_maintenance_mode(data: MaintenanceModeUpdate, current_user: dict = Depends(get_current_user)):
-    """Toggle maintenance mode (Super Admin only)"""
-    check_access(current_user, ["Super Admin"])
+    """Toggle maintenance mode (Super Admin, or another role explicitly granted
+    via Administration > Droits d'accès)"""
+    await check_access_or_role_permission(current_user, ["Super Admin"], "admin.maintenance")
 
     scope = data.scope if data.scope in ("site", "page") else "site"
     page_path = data.page_path if scope == "page" else None
