@@ -1,4 +1,4 @@
-from fastapi import FastAPI, APIRouter, HTTPException, Depends, status, UploadFile, File
+from fastapi import FastAPI, APIRouter, HTTPException, Depends, status, UploadFile, File, Form
 from fastapi.responses import Response
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.staticfiles import StaticFiles
@@ -147,6 +147,7 @@ class UserResponse(BaseModel):
     badge_reviewed_at: Optional[str] = None
     badge_reviewed_by_name: Optional[str] = None
     badge_message: Optional[str] = None
+    badge_motif: Optional[str] = None
 
 class RegisterRequest(BaseModel):
     technicien_id: str
@@ -1368,7 +1369,8 @@ async def get_me(current_user: dict = Depends(get_current_user)):
         badge_requested_at=current_user.get('badge_requested_at'),
         badge_reviewed_at=current_user.get('badge_reviewed_at'),
         badge_reviewed_by_name=current_user.get('badge_reviewed_by_name'),
-        badge_message=current_user.get('badge_message')
+        badge_message=current_user.get('badge_message'),
+        badge_motif=current_user.get('badge_motif')
     )
 
 @api_router.put("/auth/me/onboarding-seen")
@@ -1815,10 +1817,12 @@ class BadgeUserResponse(BaseModel):
     badge_reviewed_at: Optional[str] = None
     badge_reviewed_by_name: Optional[str] = None
     badge_message: Optional[str] = None
+    badge_motif: Optional[str] = None
 
 @api_router.post("/me/badge")
 async def submit_my_badge_request(
     photo: UploadFile = File(...),
+    motif: Optional[str] = Form(None),
     current_user: dict = Depends(get_current_user)
 ):
     """Submit a badge request or renewal with a photo, for the currently
@@ -1856,6 +1860,7 @@ async def submit_my_badge_request(
         "badge_reviewed_at": None,
         "badge_reviewed_by_name": None,
         "badge_message": None,
+        "badge_motif": motif,
     }})
 
     # Keep the legacy technicien badge_attribue flag in sync when a link exists.
