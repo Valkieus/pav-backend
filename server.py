@@ -291,6 +291,7 @@ class FormationResponse(BaseModel):
     refused_stage: Optional[str] = None  # "coordination" | "direction"
     is_archived: bool
     disponible_catalogue: Optional[bool] = False
+    origine: Optional[str] = "demande_membre"  # "demande_membre" | "proposition_responsable"
 
 class FormationCatalogueToggle(BaseModel):
     disponible_catalogue: bool
@@ -1821,7 +1822,9 @@ async def create_formation(data: FormationCreate, current_user: dict = Depends(g
         "validated_at": None,
         "motif_refus": None,
         "refused_stage": None,
-        "is_archived": False
+        "is_archived": False,
+        "disponible_catalogue": False,
+        "origine": "demande_membre" if current_user['niveau_acces'] == 'Membre' else "proposition_responsable"
     }
     await db.formations.insert_one(formation)
     await log_action(current_user['id'], current_user['full_name'], "Demande formation", f"Formation demandée: {data.titre}")
