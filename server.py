@@ -139,6 +139,14 @@ class UserResponse(BaseModel):
     # "already seen" (True) so the onboarding guide only pops up for genuinely
     # new accounts, not retroactively for the whole existing team.
     onboarding_seen: Optional[bool] = True
+    # Badge — request/renewal workflow. None | "en_attente_validation" | "non_conforme" | "validee"
+    badge_status: Optional[str] = None
+    badge_photo_url: Optional[str] = None
+    badge_is_renewal: Optional[bool] = False
+    badge_requested_at: Optional[str] = None
+    badge_reviewed_at: Optional[str] = None
+    badge_reviewed_by_name: Optional[str] = None
+    badge_message: Optional[str] = None
 
 class RegisterRequest(BaseModel):
     technicien_id: str
@@ -197,16 +205,6 @@ class TechnicienResponse(BaseModel):
     is_archived: bool
     created_at: str
     updated_at: str
-    # Badge — request/renewal workflow (distinct from the manual "badge_attribue"
-    # flag above, which just records whether a physical badge has ever been
-    # handed out). None | "demande" | "en_attente_validation" | "non_conforme" | "validee"
-    badge_status: Optional[str] = None
-    badge_photo_url: Optional[str] = None
-    badge_is_renewal: Optional[bool] = False
-    badge_requested_at: Optional[str] = None
-    badge_reviewed_at: Optional[str] = None
-    badge_reviewed_by_name: Optional[str] = None
-    badge_message: Optional[str] = None
 
 class BadgeRejectRequest(BaseModel):
     message: str
@@ -1302,7 +1300,14 @@ async def get_me(current_user: dict = Depends(get_current_user)):
         created_at=current_user['created_at'],
         is_active=current_user.get('is_active', True),
         must_change_password=current_user.get('must_change_password', False),
-        onboarding_seen=current_user.get('onboarding_seen', True)
+        onboarding_seen=current_user.get('onboarding_seen', True),
+        badge_status=current_user.get('badge_status'),
+        badge_photo_url=current_user.get('badge_photo_url'),
+        badge_is_renewal=current_user.get('badge_is_renewal', False),
+        badge_requested_at=current_user.get('badge_requested_at'),
+        badge_reviewed_at=current_user.get('badge_reviewed_at'),
+        badge_reviewed_by_name=current_user.get('badge_reviewed_by_name'),
+        badge_message=current_user.get('badge_message')
     )
 
 @api_router.put("/auth/me/onboarding-seen")
@@ -1659,32 +1664,40 @@ async def delete_technicien(tech_id: str, current_user: dict = Depends(get_curre
     return {"message": "Technicien supprimé"}
 
 # ==================== BADGE (demande / renouvellement) ====================
-# Self-service workflow: a Technicien uploads a clear, face-forward photo
-# (ID-photo style) to request a first badge or renew an existing one.
+# Self-service workflow: any logged-in user uploads a clear, face-forward
+# photo (ID-photo style) to request a first badge or renew an existing one.
 # Gestionnaire+ then reviews it from Effectif — confirms receipt/validates,
 # or flags it as non-compliant with a message back to the member. Every new
-# submission raises an in-app notification for Gestionnaire+ (task requested
-# by the Super Admin so nothing gets missed).
+# submission raises an in-app notification for Gestionnaire+.
+#
+# Stored on the USER document (not the technicien record): most accounts on
+# this deployment were created directly by an admin via "Nouvel utilisateur"
+# and were never linked to a technicien_id (that link is only ever set by the
+# self-registration flow). Keying badges off the user id instead means the
+# feature works for every account regardless of whether a technicien link
+# exists.
 
 BADGE_ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg'}
 
-@api_router.post("/techniciens/{tech_id}/badge")
-async def submit_badge_request(
-    tech_id: str,
+class BadgeUserResponse(BaseModel):
+    id: str
+    username: str
+    full_name: str
+    badge_status: Optional[str] = None
+    badge_photo_url: Optional[str] = None
+    badge_is_renewal: Optional[bool] = False
+    badge_requested_at: Optional[str] = None
+    badge_reviewed_at: Optional[str] = None
+    badge_reviewed_by_name: Optional[str] = None
+    badge_message: Optional[str] = None
+
+@api_router.post("/me/badge")
+async def submit_my_badge_request(
     photo: UploadFile = File(...),
     current_user: dict = Depends(get_current_user)
 ):
-    """Submit a badge request or renewal with a photo. Members may only
-    submit for their own technicien record; Gestionnaire+ may submit on
-    behalf of anyone (e.g. helping someone who can't do it themselves)."""
-    tech = await db.techniciens.find_one({"id": tech_id, "is_archived": False}, {"_id": 0})
-    if not tech:
-        raise HTTPException(status_code=404, detail="Technicien introuvable")
-
-    is_self = current_user.get('technicien_id') == tech_id
-    if not is_self:
-        check_access(current_user, ["Gestionnaire", "Responsable", "Admin", "Super Admin"])
-
+    """Submit a badge request or renewal with a photo, for the currently
+    logged-in account."""
     if not photo.filename or '.' not in photo.filename:
         raise HTTPException(status_code=400, detail="Aucune photo fournie")
     ext = photo.filename.rsplit('.', 1)[1].lower()
@@ -1708,9 +1721,9 @@ async def submit_badge_request(
     })
     photo_url = f"/api/uploads/{unique_filename}"
 
-    is_renewal = tech.get("badge_attribue", False) is True
+    is_renewal = current_user.get("badge_status") == "validee"
     now = datetime.now(timezone.utc).isoformat()
-    await db.techniciens.update_one({"id": tech_id}, {"$set": {
+    await db.users.update_one({"id": current_user['id']}, {"$set": {
         "badge_status": "en_attente_validation",
         "badge_photo_url": photo_url,
         "badge_is_renewal": is_renewal,
@@ -1718,84 +1731,84 @@ async def submit_badge_request(
         "badge_reviewed_at": None,
         "badge_reviewed_by_name": None,
         "badge_message": None,
-        "updated_at": now,
     }})
 
+    # Keep the legacy technicien badge_attribue flag in sync when a link exists.
+    if current_user.get('technicien_id'):
+        await db.techniciens.update_one(
+            {"id": current_user['technicien_id']},
+            {"$set": {"updated_at": now}}
+        )
+
     label = "Renouvellement de badge" if is_renewal else "Demande de badge"
-    await log_action(current_user['id'], current_user['full_name'], label, f"{tech.get('nom')}")
+    await log_action(current_user['id'], current_user['full_name'], label, current_user['full_name'])
 
     recipient_ids = await get_user_ids_by_roles(["Gestionnaire", "Responsable", "Admin", "Super Admin"])
     await create_notification(
         recipient_ids, "badge",
         label,
-        f"{tech.get('nom')} a soumis une photo pour son badge.",
+        f"{current_user['full_name']} a soumis une photo pour son badge.",
         link="/effectif"
     )
     return {"message": "Demande envoyée", "badge_status": "en_attente_validation", "badge_photo_url": photo_url}
 
-@api_router.get("/admin/badges", response_model=List[TechnicienResponse])
+@api_router.get("/admin/badges", response_model=List[BadgeUserResponse])
 async def list_badge_requests(current_user: dict = Depends(get_current_user)):
     check_access(current_user, ["Gestionnaire", "Responsable", "Admin", "Super Admin"])
-    techniciens = await db.techniciens.find(
-        {"badge_status": {"$ne": None}, "is_archived": False}, {"_id": 0}
+    users = await db.users.find(
+        {"badge_status": {"$ne": None}}, {"_id": 0}
     ).sort("badge_requested_at", -1).to_list(1000)
-    return [TechnicienResponse(**normalize_technicien(t)) for t in techniciens]
+    return [BadgeUserResponse(**u) for u in users]
 
-@api_router.post("/admin/badges/{tech_id}/confirm")
-async def confirm_badge(tech_id: str, current_user: dict = Depends(get_current_user)):
-    """Marks the badge as validated/issued. Also flips badge_attribue to True
-    since a validated badge implies it has now been handed out."""
+@api_router.post("/admin/badges/{user_id}/confirm")
+async def confirm_badge(user_id: str, current_user: dict = Depends(get_current_user)):
+    """Marks the badge as validated/issued."""
     check_access(current_user, ["Gestionnaire", "Responsable", "Admin", "Super Admin"])
-    tech = await db.techniciens.find_one({"id": tech_id}, {"_id": 0})
-    if not tech:
-        raise HTTPException(status_code=404, detail="Technicien introuvable")
+    target = await db.users.find_one({"id": user_id}, {"_id": 0})
+    if not target:
+        raise HTTPException(status_code=404, detail="Utilisateur introuvable")
     now = datetime.now(timezone.utc).isoformat()
-    await db.techniciens.update_one({"id": tech_id}, {"$set": {
+    await db.users.update_one({"id": user_id}, {"$set": {
         "badge_status": "validee",
-        "badge_attribue": True,
         "badge_reviewed_at": now,
         "badge_reviewed_by_name": current_user['full_name'],
         "badge_message": None,
-        "updated_at": now,
     }})
-    await log_action(current_user['id'], current_user['full_name'], "Validation badge", f"{tech.get('nom')}")
+    if target.get('technicien_id'):
+        await db.techniciens.update_one({"id": target['technicien_id']}, {"$set": {"badge_attribue": True, "updated_at": now}})
+    await log_action(current_user['id'], current_user['full_name'], "Validation badge", target.get('full_name'))
 
-    user_doc = await db.users.find_one({"technicien_id": tech_id}, {"_id": 0, "id": 1})
-    if user_doc:
-        await create_notification(
-            [user_doc["id"]], "badge",
-            "Badge validé",
-            "Votre badge a été validé.",
-            link="/mon-espace"
-        )
+    await create_notification(
+        [user_id], "badge",
+        "Badge validé",
+        "Votre badge a été validé.",
+        link="/mon-espace"
+    )
     return {"message": "Badge validé"}
 
-@api_router.post("/admin/badges/{tech_id}/reject")
-async def reject_badge(tech_id: str, data: BadgeRejectRequest, current_user: dict = Depends(get_current_user)):
+@api_router.post("/admin/badges/{user_id}/reject")
+async def reject_badge(user_id: str, data: BadgeRejectRequest, current_user: dict = Depends(get_current_user)):
     """Flags the submitted photo as non-compliant, with a message explaining
     why, sent back to the member so they can resubmit."""
     check_access(current_user, ["Gestionnaire", "Responsable", "Admin", "Super Admin"])
-    tech = await db.techniciens.find_one({"id": tech_id}, {"_id": 0})
-    if not tech:
-        raise HTTPException(status_code=404, detail="Technicien introuvable")
+    target = await db.users.find_one({"id": user_id}, {"_id": 0})
+    if not target:
+        raise HTTPException(status_code=404, detail="Utilisateur introuvable")
     now = datetime.now(timezone.utc).isoformat()
-    await db.techniciens.update_one({"id": tech_id}, {"$set": {
+    await db.users.update_one({"id": user_id}, {"$set": {
         "badge_status": "non_conforme",
         "badge_reviewed_at": now,
         "badge_reviewed_by_name": current_user['full_name'],
         "badge_message": data.message,
-        "updated_at": now,
     }})
-    await log_action(current_user['id'], current_user['full_name'], "Photo badge refusée", f"{tech.get('nom')}: {data.message}")
+    await log_action(current_user['id'], current_user['full_name'], "Photo badge refusée", f"{target.get('full_name')}: {data.message}")
 
-    user_doc = await db.users.find_one({"technicien_id": tech_id}, {"_id": 0, "id": 1})
-    if user_doc:
-        await create_notification(
-            [user_doc["id"]], "badge",
-            "Photo de badge non conforme",
-            data.message,
-            link="/mon-espace"
-        )
+    await create_notification(
+        [user_id], "badge",
+        "Photo de badge non conforme",
+        data.message,
+        link="/mon-espace"
+    )
     return {"message": "Photo signalée comme non conforme"}
 
 # ==================== MATERIEL ROUTES ====================
