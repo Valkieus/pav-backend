@@ -133,6 +133,10 @@ class UserResponse(BaseModel):
     created_at: str
     is_active: bool
     must_change_password: Optional[bool] = False
+    # Missing on users created before this field existed -> treated as
+    # "already seen" (True) so the onboarding guide only pops up for genuinely
+    # new accounts, not retroactively for the whole existing team.
+    onboarding_seen: Optional[bool] = True
 
 class RegisterRequest(BaseModel):
     technicien_id: str
@@ -1242,7 +1246,8 @@ async def login(data: UserLogin):
             branches=user.get('branches', []),
             technicien_id=user.get('technicien_id'),
             created_at=user['created_at'],
-            is_active=user.get('is_active', True)
+            is_active=user.get('is_active', True),
+            onboarding_seen=user.get('onboarding_seen', True)
         )
     )
 
@@ -1257,8 +1262,16 @@ async def get_me(current_user: dict = Depends(get_current_user)):
         technicien_id=current_user.get('technicien_id'),
         created_at=current_user['created_at'],
         is_active=current_user.get('is_active', True),
-        must_change_password=current_user.get('must_change_password', False)
+        must_change_password=current_user.get('must_change_password', False),
+        onboarding_seen=current_user.get('onboarding_seen', True)
     )
+
+@api_router.put("/auth/me/onboarding-seen")
+async def mark_onboarding_seen(current_user: dict = Depends(get_current_user)):
+    """Called once the first-login onboarding guide popup has been
+    dismissed, so it never shows again for this account."""
+    await db.users.update_one({"id": current_user['id']}, {"$set": {"onboarding_seen": True}})
+    return {"message": "Onboarding marqué comme vu"}
 
 # ==================== RGPD — SELF-SERVICE DATA RIGHTS ====================
 
@@ -1330,15 +1343,16 @@ async def create_user(data: UserCreate, current_user: dict = Depends(get_current
         "branches": data.branches or [],
         "created_at": datetime.now(timezone.utc).isoformat(),
         "is_active": True,
-        "must_change_password": True  # Force password change on first login
+        "must_change_password": True,  # Force password change on first login
+        "onboarding_seen": False  # Show the first-login onboarding guide once
     }
     await db.users.insert_one(user)
     await log_action(current_user['id'], current_user['full_name'], "Création utilisateur", f"Utilisateur créé: {data.username}")
-    
+
     return UserResponse(
         id=user['id'], username=user['username'], full_name=user['full_name'],
         niveau_acces=user['niveau_acces'], branches=user['branches'], created_at=user['created_at'], is_active=user['is_active'],
-        must_change_password=user['must_change_password']
+        must_change_password=user['must_change_password'], onboarding_seen=user['onboarding_seen']
     )
 
 @api_router.put("/auth/users/{user_id}")
@@ -1488,7 +1502,8 @@ async def register(data: RegisterRequest):
         "technicien_id": technicien["id"],
         "created_at": datetime.now(timezone.utc).isoformat(),
         "is_active": True,
-        "must_change_password": False
+        "must_change_password": False,
+        "onboarding_seen": False  # Show the first-login onboarding guide once
     }
     await db.users.insert_one(user)
     await log_action(user['id'], user['full_name'], "Auto-inscription", f"Compte créé par {full_name}")
@@ -1500,7 +1515,8 @@ async def register(data: RegisterRequest):
         user=UserResponse(
             id=user['id'], username=user['username'], full_name=user['full_name'],
             niveau_acces=user['niveau_acces'], branches=user['branches'], technicien_id=user['technicien_id'],
-            created_at=user['created_at'], is_active=user['is_active'], must_change_password=user['must_change_password']
+            created_at=user['created_at'], is_active=user['is_active'], must_change_password=user['must_change_password'],
+            onboarding_seen=user['onboarding_seen']
         )
     )
 
@@ -3506,6 +3522,31 @@ async def assign_user_groups(user_id: str, data: UserGroupAssignment, current_us
         raise HTTPException(status_code=404, detail="Utilisateur non trouvé")
     await log_action(current_user['id'], current_user['full_name'], "Attribution groupes", f"Groupes attribués à: {user_id}")
     return {"message": "Groupes attribués"}
+
+class GroupMembersUpdate(BaseModel):
+    user_ids: List[str]
+
+# Reverse of assign_user_groups above: manage membership from the group's own
+# side (pick which users belong to THIS group) instead of having to open each
+# user individually — used by the "Membres" button on each group card in the
+# Groupes tab.
+@api_router.put("/groups/enhanced/{group_id}/members")
+async def update_group_members(group_id: str, data: GroupMembersUpdate, current_user: dict = Depends(get_current_user)):
+    check_access(current_user, ["Super Admin"])
+    group = await db.groups.find_one({"id": group_id})
+    if not group:
+        raise HTTPException(status_code=404, detail="Groupe non trouvé")
+    await db.users.update_many(
+        {"id": {"$in": data.user_ids}, "group_ids": {"$ne": group_id}},
+        {"$push": {"group_ids": group_id}}
+    )
+    await db.users.update_many(
+        {"id": {"$nin": data.user_ids}, "group_ids": group_id},
+        {"$pull": {"group_ids": group_id}}
+    )
+    await log_action(current_user['id'], current_user['full_name'], "Modification membres groupe", f"Groupe: {group.get('name')}")
+    members_count = await db.users.count_documents({"group_ids": group_id})
+    return {"message": "Membres mis à jour", "members_count": members_count}
 
 # ==================== FILE UPLOAD ROUTES ====================
 
