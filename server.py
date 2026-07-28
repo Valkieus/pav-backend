@@ -11,6 +11,7 @@ import shutil
 import asyncio
 import json
 import re
+import time
 import urllib.request
 import urllib.error
 from pathlib import Path
@@ -39,6 +40,7 @@ ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_HOURS = 24
 
 app = FastAPI(title="PAV Management System API")
+SERVER_START_TIME = time.time()  # Used by /admin/system-status to report backend uptime
 api_router = APIRouter(prefix="/api")
 security = HTTPBearer()
 
@@ -2844,6 +2846,70 @@ async def get_logs(current_user: dict = Depends(get_current_user)):
     check_access(current_user, ["Super Admin", "Admin"])
     logs = await db.logs.find({}, {"_id": 0}).sort("timestamp", -1).to_list(500)
     return [LogResponse(**l) for l in logs]
+
+# ==================== SUPERVISION / SYSTEM STATUS ====================
+# Answers "how much space is used, is anything close to a crash" without
+# needing any external monitoring account — everything here comes from
+# MongoDB's own stats commands and the backend process's own clock, so it
+# keeps working forever with zero extra credentials to manage.
+
+# Collections we know about — anything not listed here still counts toward
+# db_storage_size_bytes/db_data_size_bytes (the whole-database totals), it
+# just won't get its own row in the per-collection breakdown.
+SUPERVISED_COLLECTIONS = [
+    "users", "techniciens", "planning", "absences", "formations",
+    "formation_suggestions", "devis", "fournisseurs", "materiel", "salles",
+    "creneaux", "reservations", "notifications", "logs", "groups",
+    "actualites", "documents", "organigramme", "settings",
+]
+
+@api_router.get("/admin/system-status")
+async def get_system_status(current_user: dict = Depends(get_current_user)):
+    check_access(current_user, ["Super Admin"])
+
+    mongo_ok = True
+    mongo_error = None
+    try:
+        await db.command("ping")
+    except Exception as e:
+        mongo_ok = False
+        mongo_error = str(e)
+
+    db_stats = {}
+    if mongo_ok:
+        try:
+            db_stats = await db.command("dbStats")
+        except Exception as e:
+            mongo_error = str(e)
+
+    collections_info = []
+    for name in SUPERVISED_COLLECTIONS:
+        try:
+            stats = await db.command("collStats", name)
+            collections_info.append({
+                "name": name,
+                "count": stats.get("count", 0),
+                "size_bytes": stats.get("size", 0),
+            })
+        except Exception:
+            # Collection doesn't exist yet / empty — not an error, just 0.
+            collections_info.append({"name": name, "count": 0, "size_bytes": 0})
+    collections_info.sort(key=lambda c: -c["size_bytes"])
+
+    uptime_seconds = time.time() - SERVER_START_TIME
+
+    return {
+        "mongo_connected": mongo_ok,
+        "mongo_error": mongo_error,
+        "db_data_size_bytes": db_stats.get("dataSize", 0),
+        "db_storage_size_bytes": db_stats.get("storageSize", 0),
+        "db_index_size_bytes": db_stats.get("indexSize", 0),
+        "db_collections_count": db_stats.get("collections", 0),
+        "db_objects_count": db_stats.get("objects", 0),
+        "collections": collections_info,
+        "backend_uptime_seconds": uptime_seconds,
+        "server_time": datetime.now(timezone.utc).isoformat(),
+    }
 
 # ==================== ENUMS ENDPOINTS ====================
 
