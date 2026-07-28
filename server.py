@@ -2562,7 +2562,7 @@ async def get_dashboard_stats(current_user: dict = Depends(get_current_user)):
 
 # ==================== DASHBOARD MEMBER BRIEF ====================
 
-DEFAULT_SERVICE_INFO_TEXT = "Arrivée 30 minutes avant le début du service — vendredi 18h30, dimanche 8h30."
+DEFAULT_SERVICE_INFO_TEXT = "Arrivée 30 minutes avant le début du service — vendredi 18h30, dimanche 8h00."
 
 async def get_service_info_text() -> str:
     """Short reminder of service hours shown on every Dashboard, editable at
