@@ -707,67 +707,70 @@ def build_role_section_map(sections_dict: dict) -> dict:
 
 async def check_access_or_permission(user: dict, required_levels: List[str], permission: str):
     """Same baseline as check_access (role hierarchy), OR'd with an explicit
-    permission grant from a Groupe. This is what makes assigning a group's
-    permissions to a user in Administration > Groupes actually do something,
-    instead of the permission checkboxes being purely decorative."""
-    if user['niveau_acces'] in required_levels or user['niveau_acces'] in ("Super Admin", "Admin"):
+    permission grant from a Groupe, OR'd with an explicit grant from the
+    role-permissions matrix (Administration > Droits d'accès). Super Admin
+    always passes; Admin is NOT auto-bypassed here anymore — its access to
+    every one of these permissions is a real, revocable grant (seeded once
+    at startup to preserve pre-existing behaviour, see seed_admin_permissions)."""
+    if user['niveau_acces'] == "Super Admin" or user['niveau_acces'] in required_levels:
         return
     perms = await get_user_group_permissions(user)
     if permission in perms:
+        return
+    if await role_has_permission(user['niveau_acces'], permission):
         return
     raise HTTPException(status_code=403, detail="Accès non autorisé")
 
 # ==================== MATRICE DES DROITS PAR RÔLE ====================
 # Configurable depuis Administration > Droits d'accès. Chaque entrée décrit
 # un droit précis et, pour chacun des 3 rôles configurables, s'il est déjà
-# "de base" (verrouillé, non modifiable ici) ou librement activable/
-# désactivable par un Super Admin. Le rôle Super Admin a toujours tous les
-# droits et n'apparaît pas comme colonne éditable.
+# "de base" (verrouillé, non modifiable ici), interdit (verrouillé à false,
+# séparation des tâches), ou librement activable/désactivable par un Super
+# Admin. Le rôle Super Admin a toujours tous les droits et n'apparaît pas
+# comme colonne éditable.
+#
+# admin_default=True signifie que le droit fait partie du comportement
+# historique d'Admin (accès total sauf Supervision) et a été accordé une
+# fois pour toutes au démarrage (voir seed_admin_permissions) — Admin reste
+# libre d'être décoché ensuite par un Super Admin, ce n'est plus verrouillé.
 CONFIGURABLE_ROLES = ["Responsable", "Gestionnaire", "Admin"]
 
 PERMISSION_CATALOG = [
-    {
-        "key": "actualites.write",
-        "label": "Publier / modifier des actualités",
-        "baseline": ["Gestionnaire", "Responsable"],
-        "admin_bypass": True,
-    },
-    {
-        "key": "documents.write",
-        "label": "Ajouter / modifier des documents (base de connaissance)",
-        "baseline": ["Gestionnaire", "Responsable"],
-        "admin_bypass": True,
-    },
-    {
-        "key": "admin.restart",
-        "label": "Redémarrer le serveur",
-        "baseline": [],
-        "admin_bypass": False,
-    },
-    {
-        "key": "admin.cleanup",
-        "label": "Nettoyer les fichiers orphelins / purger les logs",
-        "baseline": [],
-        "admin_bypass": False,
-    },
-    {
-        "key": "admin.storage_quota",
-        "label": "Modifier le quota de stockage",
-        "baseline": [],
-        "admin_bypass": False,
-    },
-    {
-        "key": "admin.maintenance",
-        "label": "Activer / désactiver le mode maintenance",
-        "baseline": [],
-        "admin_bypass": False,
-    },
+    # --- Actualités ---
+    {"key": "actualites.write", "label": "Actualités — publier / modifier", "baseline": ["Gestionnaire", "Responsable"], "admin_default": True},
+    # --- Documents ---
+    {"key": "documents.write", "label": "Documents — ajouter / modifier (base de connaissance)", "baseline": ["Gestionnaire", "Responsable"], "admin_default": True},
+    # --- Effectif ---
+    {"key": "effectif.write", "label": "Effectif — créer / modifier une fiche technicien", "baseline": ["Responsable"], "admin_default": True},
+    {"key": "effectif.approve", "label": "Effectif — valider / refuser une fiche proposée par un Responsable", "baseline": ["Gestionnaire"], "admin_default": True, "forbidden": ["Responsable"]},
+    {"key": "effectif.delete", "label": "Effectif — archiver une fiche technicien", "baseline": [], "admin_default": True},
+    # --- Planning ---
+    {"key": "planning.write", "label": "Planning — modifier les affectations (le détail par section reste géré via Groupes & Droits)", "baseline": ["Gestionnaire", "Responsable"], "admin_default": True},
+    {"key": "planning.delete", "label": "Planning — archiver un planning", "baseline": [], "admin_default": True},
+    # --- Devis ---
+    {"key": "devis.validate", "label": "Devis — valider / refuser un devis", "baseline": ["Responsable"], "admin_default": True},
+    {"key": "devis.delete", "label": "Devis — archiver un devis", "baseline": [], "admin_default": True},
+    # --- Formations ---
+    {"key": "formations.validate", "label": "Formations — valider une demande", "baseline": ["Gestionnaire", "Responsable"], "admin_default": True},
+    {"key": "formations.write", "label": "Formations — gérer les suggestions", "baseline": ["Gestionnaire", "Responsable"], "admin_default": True},
+    {"key": "formations.delete", "label": "Formations — archiver une formation", "baseline": [], "admin_default": True},
+    # --- Logistique / Matériel ---
+    {"key": "logistique.write", "label": "Logistique — créer / modifier du matériel", "baseline": ["Gestionnaire", "Responsable"], "admin_default": True},
+    {"key": "logistique.delete", "label": "Logistique — archiver du matériel", "baseline": [], "admin_default": True},
+    # --- Salles ---
+    {"key": "salles.write", "label": "Salles — gérer les salles et créneaux", "baseline": [], "admin_default": True},
+    {"key": "salles.reservations", "label": "Salles — valider / refuser une réservation", "baseline": ["Responsable"], "admin_default": True},
+    # --- Administration / Supervision (Admin non accordé par défaut) ---
+    {"key": "admin.restart", "label": "Supervision — redémarrer le serveur", "baseline": [], "admin_default": False},
+    {"key": "admin.cleanup", "label": "Supervision — nettoyer les fichiers orphelins / purger les logs", "baseline": [], "admin_default": False},
+    {"key": "admin.storage_quota", "label": "Supervision — modifier le quota de stockage", "baseline": [], "admin_default": False},
+    {"key": "admin.maintenance", "label": "Maintenance — activer / désactiver le mode maintenance", "baseline": [], "admin_default": False},
 ]
 _PERMISSION_CATALOG_BY_KEY = {e["key"]: e for e in PERMISSION_CATALOG}
 
 async def role_has_permission(role: str, permission: str) -> bool:
     """Explicit grant made via Administration > Droits d'accès for a role
-    that is neither baseline nor admin-bypassed for this permission."""
+    that is neither baseline nor forbidden for this permission."""
     doc = await db.role_permissions.find_one({"role": role, "permission": permission}, {"_id": 0})
     return doc is not None
 
@@ -798,10 +801,10 @@ async def get_role_permissions_matrix(current_user: dict = Depends(get_current_u
     for entry in PERMISSION_CATALOG:
         row = {"key": entry["key"], "label": entry["label"], "roles": {}}
         for role in CONFIGURABLE_ROLES:
-            if role in entry["baseline"]:
+            if role in entry.get("forbidden", []):
+                row["roles"][role] = {"granted": False, "locked": True, "reason": "Non autorisable pour ce rôle (séparation des tâches)"}
+            elif role in entry["baseline"]:
                 row["roles"][role] = {"granted": True, "locked": True, "reason": "Droit de base du rôle"}
-            elif role == "Admin" and entry["admin_bypass"]:
-                row["roles"][role] = {"granted": True, "locked": True, "reason": "Admin a accès à tout sauf les actions verrouillées Super Admin"}
             else:
                 row["roles"][role] = {"granted": entry["key"] in grants.get(role, set()), "locked": False, "reason": None}
         rows.append(row)
@@ -815,8 +818,8 @@ async def update_role_permission(data: RolePermissionUpdate, current_user: dict 
     entry = _PERMISSION_CATALOG_BY_KEY.get(data.permission)
     if not entry:
         raise HTTPException(status_code=404, detail="Droit inconnu")
-    if data.role in entry["baseline"] or (data.role == "Admin" and entry["admin_bypass"]):
-        raise HTTPException(status_code=400, detail="Ce droit est déjà accordé de base à ce rôle et ne peut pas être modifié ici")
+    if data.role in entry["baseline"] or data.role in entry.get("forbidden", []):
+        raise HTTPException(status_code=400, detail="Ce droit ne peut pas être modifié pour ce rôle")
     if data.granted:
         await db.role_permissions.update_one(
             {"role": data.role, "permission": data.permission},
@@ -1794,8 +1797,10 @@ async def get_techniciens(include_archived: bool = False, current_user: dict = D
 @api_router.get("/techniciens/pending", response_model=List[TechnicienResponse])
 async def get_pending_techniciens(current_user: dict = Depends(get_current_user)):
     # Coordination = Gestionnaire+ (le rôle Responsable qui soumet la fiche
-    # ne doit pas pouvoir se valider lui-même).
-    await check_access_or_permission(current_user, ["Super Admin", "Gestionnaire"], "effectif.write")
+    # ne doit pas pouvoir se valider lui-même — d'où un droit "effectif.approve"
+    # distinct de "effectif.write", explicitement interdit pour Responsable
+    # dans la matrice de Droits d'accès).
+    await check_access_or_permission(current_user, ["Super Admin", "Gestionnaire"], "effectif.approve")
     techs = await db.techniciens.find({"is_pending_approval": True}, {"_id": 0}).sort("created_at", -1).to_list(500)
     return [TechnicienResponse(**normalize_technicien(t)) for t in techs]
 
@@ -1839,7 +1844,7 @@ async def create_technicien(data: TechnicienCreate, current_user: dict = Depends
 
 @api_router.post("/techniciens/{tech_id}/approve", response_model=TechnicienResponse)
 async def approve_technicien(tech_id: str, current_user: dict = Depends(get_current_user)):
-    await check_access_or_permission(current_user, ["Super Admin", "Gestionnaire"], "effectif.write")
+    await check_access_or_permission(current_user, ["Super Admin", "Gestionnaire"], "effectif.approve")
     tech = await db.techniciens.find_one({"id": tech_id}, {"_id": 0})
     if not tech:
         raise HTTPException(status_code=404, detail="Technicien introuvable")
@@ -1859,7 +1864,7 @@ async def approve_technicien(tech_id: str, current_user: dict = Depends(get_curr
 
 @api_router.post("/techniciens/{tech_id}/reject")
 async def reject_technicien(tech_id: str, data: TechnicienRejectRequest, current_user: dict = Depends(get_current_user)):
-    await check_access_or_permission(current_user, ["Super Admin", "Gestionnaire"], "effectif.write")
+    await check_access_or_permission(current_user, ["Super Admin", "Gestionnaire"], "effectif.approve")
     tech = await db.techniciens.find_one({"id": tech_id}, {"_id": 0})
     if not tech:
         raise HTTPException(status_code=404, detail="Technicien introuvable")
@@ -4464,6 +4469,33 @@ async def startup():
             logger.info(f"Migration rôle Membre->Technicien: {r1.modified_count} users, {r2.modified_count} techniciens")
     except Exception as e:
         logger.warning(f"Membre->Technicien migration skipped: {e}")
+
+    # One-off migration: Admin used to unconditionally bypass every
+    # check_access_or_permission() call (effectif, planning, devis,
+    # formations, logistique, salles, actualités, documents). That bypass
+    # was removed so a Super Admin can genuinely revoke individual rights
+    # from Admin via Administration > Droits d'accès. To avoid silently
+    # breaking Admin's existing access the moment this ships, seed an
+    # explicit grant for every "admin_default: True" permission the first
+    # time the app boots with this migration — a no-op on every later boot.
+    try:
+        marker = await db.settings.find_one({"key": "admin_permissions_seeded_v1"})
+        if not marker:
+            for entry in PERMISSION_CATALOG:
+                if entry.get("admin_default"):
+                    await db.role_permissions.update_one(
+                        {"role": "Admin", "permission": entry["key"]},
+                        {"$set": {"role": "Admin", "permission": entry["key"]}},
+                        upsert=True,
+                    )
+            await db.settings.update_one(
+                {"key": "admin_permissions_seeded_v1"},
+                {"$set": {"key": "admin_permissions_seeded_v1", "value": True}},
+                upsert=True,
+            )
+            logger.info("Droits Admin par défaut initialisés (admin_permissions_seeded_v1)")
+    except Exception as e:
+        logger.warning(f"Admin permissions seeding skipped: {e}")
 
     # RGPD: purge activity logs older than 12 months (data retention policy).
     # Shares the same helper as the manual "Nettoyer maintenant" button and
