@@ -979,6 +979,22 @@ COORDINATION_NOTIFY_EMAIL = os.environ.get('COORDINATION_NOTIFY_EMAIL') or ADMIN
 EMAIL_ENABLED = bool(SENDGRID_API_KEY and SENDGRID_FROM_EMAIL)
 APP_URL = os.environ.get('APP_URL', 'https://pav-manager-app.netlify.app')
 
+# Optional infrastructure-monitoring credentials for Administration > Supervision
+# (see /admin/infra-status below). Both are read-only "personal access token"
+# style keys — neither can move money, delete data, or change billing on their
+# own service, but treat them as secrets like any other API key here.
+#   RENDER_API_KEY    -> Render dashboard > Account Settings > API Keys
+#   RENDER_SERVICE_ID -> defaults to the current EU backend service if unset
+#   NETLIFY_API_TOKEN -> Netlify dashboard > User settings > Applications > Personal access tokens
+#   NETLIFY_SITE_ID   -> the site's "Site ID" (or its <name>.netlify.app subdomain), from Site settings > General
+# Until these are set, /admin/infra-status still returns a live self-check of
+# this backend + database, and reports the two hosting cards as "not configured"
+# rather than failing.
+RENDER_API_KEY = os.environ.get('RENDER_API_KEY')
+RENDER_SERVICE_ID = os.environ.get('RENDER_SERVICE_ID', 'srv-d9l2oo2d0e5s73en37g0')
+NETLIFY_API_TOKEN = os.environ.get('NETLIFY_API_TOKEN')
+NETLIFY_SITE_ID = os.environ.get('NETLIFY_SITE_ID')
+
 def _send_email_sync(to: str, subject: str, body_html: str):
     # A plain-text alternative alongside the HTML body. Multipart messages
     # (text/plain + text/html) are generally trusted more by spam filters
@@ -3412,6 +3428,106 @@ async def get_system_status(current_user: dict = Depends(get_current_user)):
         "remaining_bytes": remaining_bytes,
         "percent_used": percent_used,
         "last_logs_purge": (last_logs_purge_doc or {}).get("month"),
+    }
+
+def _fetch_json_sync(url: str, headers: dict, timeout: int = 8):
+    req = urllib.request.Request(url, headers=headers, method="GET")
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+async def _get_backend_self_check():
+    """Live check of this very process + its DB connection — always available,
+    no external API key needed."""
+    start = time.time()
+    mongo_ok = True
+    try:
+        await db.command("ping")
+    except Exception:
+        mongo_ok = False
+    return {
+        "ok": mongo_ok,
+        "mongo_connected": mongo_ok,
+        "uptime_seconds": time.time() - SERVER_START_TIME,
+        "response_time_ms": round((time.time() - start) * 1000, 1),
+        "region": "Frankfurt (EU Central)",
+        "url": "https://pav-backend-eu.onrender.com",
+    }
+
+async def _get_render_status():
+    if not RENDER_API_KEY:
+        return {
+            "configured": False,
+            "message": "Ajoutez la variable RENDER_API_KEY (Render > Account Settings > API Keys) pour voir ici le statut, la région, le plan et le dernier déploiement du service en direct.",
+        }
+    headers = {"Authorization": f"Bearer {RENDER_API_KEY}", "Accept": "application/json"}
+    try:
+        service = await asyncio.to_thread(
+            _fetch_json_sync, f"https://api.render.com/v1/services/{RENDER_SERVICE_ID}", headers
+        )
+        deploys = await asyncio.to_thread(
+            _fetch_json_sync, f"https://api.render.com/v1/services/{RENDER_SERVICE_ID}/deploys?limit=1", headers
+        )
+        latest = (deploys[0] or {}).get("deploy") if deploys else None
+        details = service.get("serviceDetails") or {}
+        return {
+            "configured": True,
+            "ok": not service.get("suspended") or service.get("suspended") == "not_suspended",
+            "name": service.get("name"),
+            "suspended": service.get("suspended"),
+            "region": details.get("region"),
+            "plan": details.get("plan"),
+            "url": details.get("url"),
+            "latest_deploy_status": (latest or {}).get("status"),
+            "latest_deploy_at": (latest or {}).get("finishedAt") or (latest or {}).get("createdAt"),
+            "latest_deploy_commit": ((latest or {}).get("commit") or {}).get("message"),
+        }
+    except urllib.error.HTTPError as e:
+        return {"configured": True, "ok": False, "error": f"Render API HTTP {e.code} — vérifiez RENDER_API_KEY et RENDER_SERVICE_ID."}
+    except Exception as e:
+        return {"configured": True, "ok": False, "error": str(e)}
+
+async def _get_netlify_status():
+    if not NETLIFY_API_TOKEN or not NETLIFY_SITE_ID:
+        return {
+            "configured": False,
+            "message": "Ajoutez NETLIFY_API_TOKEN (Netlify > User settings > Applications > Personal access tokens) et NETLIFY_SITE_ID (Site settings > General > Site ID) pour voir ici le statut et le dernier déploiement du site en direct.",
+        }
+    headers = {"Authorization": f"Bearer {NETLIFY_API_TOKEN}", "Accept": "application/json"}
+    try:
+        site = await asyncio.to_thread(
+            _fetch_json_sync, f"https://api.netlify.com/api/v1/sites/{NETLIFY_SITE_ID}", headers
+        )
+        published = site.get("published_deploy") or {}
+        return {
+            "configured": True,
+            "ok": published.get("state") == "ready",
+            "name": site.get("name"),
+            "url": site.get("url") or site.get("ssl_url"),
+            "state": site.get("state"),
+            "latest_deploy_state": published.get("state"),
+            "latest_deploy_at": published.get("published_at") or published.get("created_at"),
+            "latest_deploy_title": published.get("title") or published.get("commit_ref"),
+        }
+    except urllib.error.HTTPError as e:
+        return {"configured": True, "ok": False, "error": f"Netlify API HTTP {e.code} — vérifiez NETLIFY_API_TOKEN et NETLIFY_SITE_ID."}
+    except Exception as e:
+        return {"configured": True, "ok": False, "error": str(e)}
+
+@api_router.get("/admin/infra-status")
+async def get_infra_status(current_user: dict = Depends(get_current_user)):
+    """Consolidated live view of the whole stack for Administration > Supervision:
+    this backend + its DB connection (always live), plus the Render (backend
+    host) and Netlify (frontend host) services if their API credentials are
+    configured — see the RENDER_*/NETLIFY_* env vars above."""
+    check_access(current_user, ["Super Admin", "Admin"])
+    backend_check, render_info, netlify_info = await asyncio.gather(
+        _get_backend_self_check(), _get_render_status(), _get_netlify_status()
+    )
+    return {
+        "backend": backend_check,
+        "render": render_info,
+        "netlify": netlify_info,
+        "checked_at": datetime.now(timezone.utc).isoformat(),
     }
 
 class StorageQuotaUpdate(BaseModel):
