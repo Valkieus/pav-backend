@@ -580,6 +580,9 @@ class MaintenanceModeUpdate(BaseModel):
     message: Optional[str] = None
     scope: Optional[str] = "site"  # "site" = whole app, "page" = a single page path
     page_path: Optional[str] = None  # required when scope == "page"
+    # Roles impacted by this maintenance activation. None/empty = everyone below Super Admin
+    # (default/legacy behavior). Super Admin is never impacted regardless of this list.
+    affected_roles: Optional[List[str]] = None
 
 class MaintenanceModeResponse(BaseModel):
     is_active: bool
@@ -588,6 +591,7 @@ class MaintenanceModeResponse(BaseModel):
     activated_at: Optional[str] = None
     scope: Optional[str] = "site"
     page_path: Optional[str] = None
+    affected_roles: Optional[List[str]] = None
 
 # ==================== GROUP MODELS (ENHANCED) ====================
 
@@ -4394,6 +4398,7 @@ async def get_maintenance_mode():
     stored = maintenance.get("value", {})
     stored.setdefault("scope", "site")
     stored.setdefault("page_path", None)
+    stored.setdefault("affected_roles", None)
     return MaintenanceModeResponse(**stored)
 
 @api_router.put("/maintenance", response_model=MaintenanceModeResponse)
@@ -4407,6 +4412,13 @@ async def update_maintenance_mode(data: MaintenanceModeUpdate, current_user: dic
     if scope == "page" and not page_path:
         raise HTTPException(status_code=400, detail="page_path requis lorsque la portée est 'page'")
 
+    valid_roles = {"Technicien", "Gestionnaire", "Responsable", "Admin"}
+    affected_roles = None
+    if data.affected_roles:
+        affected_roles = [r for r in data.affected_roles if r in valid_roles]
+        if not affected_roles:
+            raise HTTPException(status_code=400, detail="affected_roles doit contenir au moins un rôle valide")
+
     now = datetime.now(timezone.utc).isoformat()
     value = {
         "is_active": data.is_active,
@@ -4414,7 +4426,8 @@ async def update_maintenance_mode(data: MaintenanceModeUpdate, current_user: dic
         "activated_by": current_user['full_name'] if data.is_active else None,
         "activated_at": now if data.is_active else None,
         "scope": scope,
-        "page_path": page_path
+        "page_path": page_path,
+        "affected_roles": affected_roles
     }
 
     await db.settings.update_one(
