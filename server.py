@@ -1,3 +1,4 @@
+# redeploy-marker: 2026-07-29T10-45 (maintenance affected_roles feature)
 from fastapi import FastAPI, APIRouter, HTTPException, Depends, status, UploadFile, File, Form
 from fastapi.responses import Response
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
