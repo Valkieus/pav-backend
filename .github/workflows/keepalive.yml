@@ -10,5 +10,5 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Ping health endpoint
-        run: curl -sf https://pav-backend-7jyx.onrender.com/api/health || true
+        run: curl -sf https://pav-backend-eu.onrender.com/api/health || true
 
