@@ -3428,6 +3428,41 @@ async def set_storage_quota(data: StorageQuotaUpdate, current_user: dict = Depen
     await log_action(current_user['id'], current_user['full_name'], "Modification quota stockage",
                       f"{data.quota_gb} Go" if quota_bytes else "Quota retiré")
     return {"quota_bytes": quota_bytes}
+    # ---- One-time migration helper: copy every collection from this database ----
+# (Railway) into a MongoDB Atlas free-tier cluster. Reads the Atlas connection
+# string from the ATLAS_MIGRATION_URL env var (set manually in Railway, never
+# committed to git). Super Admin only. Safe to re-run (overwrites destination
+# collections each time). Remove this endpoint once the migration is verified.
+@api_router.post("/admin/migrate-to-atlas")
+async def migrate_to_atlas(current_user: dict = Depends(get_current_user)):
+    check_access(current_user, ["Super Admin"])
+    atlas_url = os.environ.get("ATLAS_MIGRATION_URL")
+    if not atlas_url:
+        raise HTTPException(status_code=400, detail="ATLAS_MIGRATION_URL non configurée sur ce service")
+    atlas_client = AsyncIOMotorClient(atlas_url, serverSelectionTimeoutMS=15000)
+    try:
+        await atlas_client.admin.command("ping")
+    except Exception as e:
+        atlas_client.close()
+        raise HTTPException(status_code=502, detail=f"Connexion Atlas échouée: {e}")
+
+    atlas_db = atlas_client[os.environ['DB_NAME']]
+    results = {}
+    try:
+        collection_names = await db.list_collection_names()
+        for coll_name in collection_names:
+            docs = await db[coll_name].find({}).to_list(length=None)
+            if docs:
+                await atlas_db[coll_name].delete_many({})
+                await atlas_db[coll_name].insert_many(docs)
+            dst_count = await atlas_db[coll_name].count_documents({})
+            results[coll_name] = {"source": len(docs), "dest": dst_count}
+    finally:
+        atlas_client.close()
+
+    await log_action(current_user['id'], current_user['full_name'], "Migration base de données",
+                      f"{len(results)} collections copiées vers Atlas")
+    return {"status": "ok", "collections": results}
 
 # ---- Nettoyage : fichiers orphelins ----
 # Un fichier uploadé (collection `files`, servi via GET /api/uploads/{id})
