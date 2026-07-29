@@ -1,4 +1,4 @@
-# redeploy-marker: 2026-07-29T10-45 (maintenance affected_roles feature)
+# redeploy-marker: 2026-07-29T13-40 (temporary Atlas migration endpoint)
 from fastapi import FastAPI, APIRouter, HTTPException, Depends, status, UploadFile, File, Form
 from fastapi.responses import Response
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -3435,6 +3435,18 @@ def _fetch_json_sync(url: str, headers: dict, timeout: int = 8):
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
+def _request_json_sync(url: str, headers: dict, method: str = "GET", body: dict = None, timeout: int = 15):
+    """Same as _fetch_json_sync but supports POST/PUT with a JSON body — used
+    for the redeploy/restore actions below (not just read-only status)."""
+    data = json.dumps(body).encode("utf-8") if body is not None else None
+    req_headers = dict(headers)
+    if data is not None:
+        req_headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, headers=req_headers, method=method, data=data)
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        raw = resp.read().decode("utf-8")
+        return json.loads(raw) if raw else {}
+
 async def _get_backend_self_check():
     """Live check of this very process + its DB connection — always available,
     no external API key needed."""
@@ -3530,6 +3542,107 @@ async def get_infra_status(current_user: dict = Depends(get_current_user)):
         "checked_at": datetime.now(timezone.utc).isoformat(),
     }
 
+# ---- Actions d'infrastructure (Supervision) ----
+# Ces routes permettent d'agir directement sur Render/Netlify sans quitter
+# l'application (redéployer, consulter l'historique, restaurer un ancien
+# déploiement Netlify). Lecture seule à part les deux actions explicitement
+# marquées "action" — toutes réservées Super Admin, comme redémarrer le
+# serveur ci-dessous, car elles affectent l'infrastructure en direct.
+
+@api_router.get("/admin/infra/render/deploys")
+async def list_render_deploys(current_user: dict = Depends(get_current_user)):
+    check_access(current_user, ["Super Admin", "Admin"])
+    if not RENDER_API_KEY:
+        raise HTTPException(status_code=400, detail="RENDER_API_KEY non configurée")
+    headers = {"Authorization": f"Bearer {RENDER_API_KEY}", "Accept": "application/json"}
+    try:
+        deploys = await asyncio.to_thread(
+            _fetch_json_sync, f"https://api.render.com/v1/services/{RENDER_SERVICE_ID}/deploys?limit=5", headers
+        )
+        return [
+            {
+                "id": (d.get("deploy") or {}).get("id"),
+                "status": (d.get("deploy") or {}).get("status"),
+                "created_at": (d.get("deploy") or {}).get("createdAt"),
+                "finished_at": (d.get("deploy") or {}).get("finishedAt"),
+                "commit_message": ((d.get("deploy") or {}).get("commit") or {}).get("message"),
+            }
+            for d in (deploys or [])
+        ]
+    except urllib.error.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"Render API HTTP {e.code}")
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+@api_router.post("/admin/infra/render/redeploy")
+async def redeploy_render(current_user: dict = Depends(get_current_user)):
+    check_access(current_user, ["Super Admin"])
+    if not RENDER_API_KEY:
+        raise HTTPException(status_code=400, detail="RENDER_API_KEY non configurée")
+    headers = {"Authorization": f"Bearer {RENDER_API_KEY}", "Accept": "application/json"}
+    try:
+        deploy = await asyncio.to_thread(
+            _request_json_sync,
+            f"https://api.render.com/v1/services/{RENDER_SERVICE_ID}/deploys",
+            headers,
+            "POST",
+            {"clearCache": "do_not_clear"},
+        )
+        await log_action(current_user['id'], current_user['full_name'], "Redéploiement backend (Render) déclenché", "")
+        return {"message": "Redéploiement lancé — comptez 2 à 5 minutes.", "deploy_id": deploy.get("id")}
+    except urllib.error.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"Render API HTTP {e.code}")
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+@api_router.get("/admin/infra/netlify/deploys")
+async def list_netlify_deploys(current_user: dict = Depends(get_current_user)):
+    check_access(current_user, ["Super Admin", "Admin"])
+    if not NETLIFY_API_TOKEN or not NETLIFY_SITE_ID:
+        raise HTTPException(status_code=400, detail="NETLIFY_API_TOKEN / NETLIFY_SITE_ID non configurés")
+    headers = {"Authorization": f"Bearer {NETLIFY_API_TOKEN}", "Accept": "application/json"}
+    try:
+        deploys = await asyncio.to_thread(
+            _fetch_json_sync,
+            f"https://api.netlify.com/api/v1/sites/{NETLIFY_SITE_ID}/deploys?per_page=5",
+            headers,
+        )
+        return [
+            {
+                "id": d.get("id"),
+                "state": d.get("state"),
+                "created_at": d.get("created_at"),
+                "title": d.get("title") or d.get("commit_ref"),
+                "is_current": d.get("state") == "current" or d.get("published_at") is not None and d.get("state") == "ready",
+            }
+            for d in (deploys or [])
+        ]
+    except urllib.error.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"Netlify API HTTP {e.code}")
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+@api_router.post("/admin/infra/netlify/deploys/{deploy_id}/restore")
+async def restore_netlify_deploy(deploy_id: str, current_user: dict = Depends(get_current_user)):
+    check_access(current_user, ["Super Admin"])
+    if not NETLIFY_API_TOKEN or not NETLIFY_SITE_ID:
+        raise HTTPException(status_code=400, detail="NETLIFY_API_TOKEN / NETLIFY_SITE_ID non configurés")
+    headers = {"Authorization": f"Bearer {NETLIFY_API_TOKEN}", "Accept": "application/json"}
+    try:
+        await asyncio.to_thread(
+            _request_json_sync,
+            f"https://api.netlify.com/api/v1/sites/{NETLIFY_SITE_ID}/deploys/{deploy_id}/restore",
+            headers,
+            "POST",
+            {},
+        )
+        await log_action(current_user['id'], current_user['full_name'], "Restauration déploiement Netlify", deploy_id)
+        return {"message": "Déploiement restauré comme version en ligne."}
+    except urllib.error.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"Netlify API HTTP {e.code}")
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
 class StorageQuotaUpdate(BaseModel):
     quota_gb: float  # 0 or omitted clears the quota (back to "no quota set")
 
@@ -3545,7 +3658,8 @@ async def set_storage_quota(data: StorageQuotaUpdate, current_user: dict = Depen
     await log_action(current_user['id'], current_user['full_name'], "Modification quota stockage",
                       f"{data.quota_gb} Go" if quota_bytes else "Quota retiré")
     return {"quota_bytes": quota_bytes}
-    # ---- One-time migration helper: copy every collection from this database ----
+
+# ---- One-time migration helper: copy every collection from this database ----
 # (Railway) into a MongoDB Atlas free-tier cluster. Reads the Atlas connection
 # string from the ATLAS_MIGRATION_URL env var (set manually in Railway, never
 # committed to git). Super Admin only. Safe to re-run (overwrites destination
@@ -4610,7 +4724,7 @@ async def startup():
         # users.id is looked up on nearly every authenticated request (get_current_user);
         # groups.id is looked up on most of those too (permissions/scope resolution).
         # Without these, every request was doing full collection scans on the free
-        # Atlas cluster - a major cause of per-request lag.
+        # Atlas cluster — the main cause of the ~600-700ms per-request lag.
         await db.users.create_index("id", unique=True)
         await db.users.create_index("username", unique=True)
         await db.groups.create_index("id", unique=True)
