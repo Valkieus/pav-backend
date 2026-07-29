@@ -4491,6 +4491,13 @@ async def startup():
         await db.planning.create_index([("annee", 1), ("mois", 1)], unique=True)
         await db.techniciens.create_index("nom")
         await db.reservations.create_index([("salle_id", 1), ("date", 1)])
+        # users.id is looked up on nearly every authenticated request (get_current_user);
+        # groups.id is looked up on most of those too (permissions/scope resolution).
+        # Without these, every request was doing full collection scans on the free
+        # Atlas cluster - a major cause of per-request lag.
+        await db.users.create_index("id", unique=True)
+        await db.users.create_index("username", unique=True)
+        await db.groups.create_index("id", unique=True)
         logger.info("MongoDB indexes created")
     except Exception as e:
         logger.warning(f"Index creation skipped: {e}")
