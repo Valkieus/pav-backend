@@ -3114,6 +3114,17 @@ async def archive_planning_evenement(evenement_id: str, current_user: dict = Dep
 # vue journalière (qui est en service aujourd'hui) et par l'agrégation
 # mensuelle "Mon planning" (mes jours de service ce mois-ci).
 
+def _val_at(vals, idx: int):
+    """Certaines affectations sont stockées en Mongo comme un objet à clés
+    numériques ("0", "1", ...) plutôt qu'une vraie liste (arrive quand un
+    tableau JS partiellement rempli est sérialisé côté client) — on gère les
+    deux formes plutôt que de planter sur un IndexError/KeyError."""
+    if isinstance(vals, dict):
+        return vals.get(str(idx)) or vals.get(idx)
+    if isinstance(vals, list) and 0 <= idx < len(vals):
+        return vals[idx]
+    return None
+
 def _build_roster_for_date(date_str: str, monthly: Optional[dict], events: list) -> list:
     roster = []
     if monthly:
@@ -3137,7 +3148,7 @@ def _build_roster_for_date(date_str: str, monthly: Optional[dict], events: list)
                         for slot_idx in range(slots):
                             key = f"{role_key}_{slot_idx}"
                             vals = affectations.get(key) or []
-                            nom = vals[date_idx] if date_idx < len(vals) else None
+                            nom = _val_at(vals, date_idx)
                             if nom:
                                 roster.append({
                                     "source": "equipe",
@@ -3161,7 +3172,7 @@ def _build_roster_for_date(date_str: str, monthly: Optional[dict], events: list)
             for slot_idx in range(slots):
                 key = f"{role_key}_{slot_idx}"
                 vals = ev_affectations.get(key) or []
-                nom = vals[date_idx] if date_idx < len(vals) else None
+                nom = _val_at(vals, date_idx)
                 if nom:
                     roster.append({
                         "source": "evenement",
