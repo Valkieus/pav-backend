@@ -20,6 +20,7 @@ from pathlib import Path
 from pydantic import BaseModel, Field, field_validator
 from typing import List, Optional
 import uuid
+import calendar
 from datetime import datetime, timezone, timedelta
 import jwt
 import bcrypt
@@ -3104,31 +3105,26 @@ async def archive_planning_evenement(evenement_id: str, current_user: dict = Dep
     await log_action(current_user['id'], current_user['full_name'], "Archivage planning événement", evenement_id)
     return {"message": "Événement archivé"}
 
-# ==================== VUE JOURNALIÈRE ("Mon planning") ====================
-# Combine, pour une date précise, les affectations issues du planning équipe
-# mensuel (si cette date tombe un vendredi/dimanche déjà planifié) et de tout
-# planning événement qui la couvre — support de la vue "qui est en service
-# aujourd'hui" et du filtre "juste moi".
+# ==================== VUE JOURNALIÈRE / MENSUELLE ("Mon planning") ========
+# `_build_roster_for_date` normalise, pour une date précise, les affectations
+# issues du planning équipe mensuel (si cette date tombe un vendredi/dimanche
+# déjà planifié) et de tout planning événement qui la couvre — un événement
+# est structurellement "un planning" comme le planning équipe (dates +
+# affectations), donc traité de la même façon ici. Réutilisé à la fois par la
+# vue journalière (qui est en service aujourd'hui) et par l'agrégation
+# mensuelle "Mon planning" (mes jours de service ce mois-ci).
 
-@api_router.get("/planning/jour/{date}")
-async def get_planning_jour(date: str, current_user: dict = Depends(get_current_user)):
-    try:
-        d = datetime.strptime(date, "%Y-%m-%d").date()
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Date invalide (YYYY-MM-DD attendu)")
-
+def _build_roster_for_date(date_str: str, monthly: Optional[dict], events: list) -> list:
     roster = []
-
-    monthly = await db.planning.find_one({"annee": d.year, "mois": d.month, "is_archived": False}, {"_id": 0})
     if monthly:
         day_dates = monthly.get("dates") or {}
         affectations = monthly.get("affectations") or {}
         sections = monthly.get("sections") or {}
         for day_key, day_label in (("dimanche", "Dimanche"), ("vendredi", "Vendredi")):
             lst = day_dates.get(day_key) or []
-            if date not in lst:
+            if date_str not in lst:
                 continue
-            date_idx = lst.index(date)
+            date_idx = lst.index(date_str)
             day_sections = sections.get(day_key) or {}
             for table_key in ("table1", "table2"):
                 for section in (day_sections.get(table_key) or []):
@@ -3151,15 +3147,11 @@ async def get_planning_jour(date: str, current_user: dict = Depends(get_current_
                                     "nom": nom,
                                 })
 
-    events = await db.planning_evenements.find(
-        {"is_archived": False, "date_debut": {"$lte": date}, "date_fin": {"$gte": date}},
-        {"_id": 0}
-    ).to_list(50)
     for ev in events:
         ev_dates = ev.get("dates") or []
-        if date not in ev_dates:
+        if date_str not in ev_dates:
             continue
-        date_idx = ev_dates.index(date)
+        date_idx = ev_dates.index(date_str)
         ev_affectations = ev.get("affectations") or {}
         for role in (ev.get("roles") or []):
             role_key = role.get("key")
@@ -3178,6 +3170,21 @@ async def get_planning_jour(date: str, current_user: dict = Depends(get_current_
                         "role_label": role.get("label", role_key),
                         "nom": nom,
                     })
+    return roster
+
+@api_router.get("/planning/jour/{date}")
+async def get_planning_jour(date: str, current_user: dict = Depends(get_current_user)):
+    try:
+        d = datetime.strptime(date, "%Y-%m-%d").date()
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Date invalide (YYYY-MM-DD attendu)")
+
+    monthly = await db.planning.find_one({"annee": d.year, "mois": d.month, "is_archived": False}, {"_id": 0})
+    events = await db.planning_evenements.find(
+        {"is_archived": False, "date_debut": {"$lte": date}, "date_fin": {"$gte": date}},
+        {"_id": 0}
+    ).to_list(50)
+    roster = _build_roster_for_date(date, monthly, events)
 
     my_nom = None
     if current_user.get("technicien_id"):
@@ -3191,6 +3198,63 @@ async def get_planning_jour(date: str, current_user: dict = Depends(get_current_
         "roster": roster,
         "my_nom": my_nom,
     }
+
+@api_router.get("/planning/mois/{annee}/{mois}")
+async def get_planning_mois(annee: int, mois: int, current_user: dict = Depends(get_current_user)):
+    # Vue "Mon planning" mensuelle : version réduite du planning équipe,
+    # reformatée pour ne montrer que les jours du mois où l'utilisateur
+    # connecté est de service (équipe + événements confondus).
+    if mois < 1 or mois > 12:
+        raise HTTPException(status_code=400, detail="Mois invalide")
+
+    my_nom = None
+    if current_user.get("technicien_id"):
+        tech = await db.techniciens.find_one({"id": current_user["technicien_id"]}, {"_id": 0, "nom": 1})
+        my_nom = (tech or {}).get("nom")
+
+    if not my_nom:
+        return {"annee": annee, "mois": mois, "my_nom": None, "jours": []}
+
+    monthly = await db.planning.find_one({"annee": annee, "mois": mois, "is_archived": False}, {"_id": 0})
+
+    first_day = f"{annee:04d}-{mois:02d}-01"
+    last_day_num = calendar.monthrange(annee, mois)[1]
+    last_day = f"{annee:04d}-{mois:02d}-{last_day_num:02d}"
+    events = await db.planning_evenements.find(
+        {"is_archived": False, "date_debut": {"$lte": last_day}, "date_fin": {"$gte": first_day}},
+        {"_id": 0}
+    ).to_list(50)
+
+    candidate_dates = set()
+    if monthly:
+        day_dates = monthly.get("dates") or {}
+        for key in ("dimanche", "vendredi"):
+            for ds in (day_dates.get(key) or []):
+                candidate_dates.add(ds)
+    month_prefix = f"{annee:04d}-{mois:02d}"
+    for ev in events:
+        for ds in (ev.get("dates") or []):
+            if ds.startswith(month_prefix):
+                candidate_dates.add(ds)
+
+    jours_semaine = ["Lundi", "Mardi", "Mercredi", "Jeudi", "Vendredi", "Samedi", "Dimanche"]
+    jours = []
+    for ds in sorted(candidate_dates):
+        roster = _build_roster_for_date(ds, monthly, events)
+        mine = [r for r in roster if r["nom"] == my_nom]
+        if not mine:
+            continue
+        d_obj = datetime.strptime(ds, "%Y-%m-%d").date()
+        jours.append({
+            "date": ds,
+            "jour_semaine": jours_semaine[d_obj.weekday()],
+            "items": [
+                {"role_label": m["role_label"], "section": m["section"], "source_label": m["source_label"]}
+                for m in mine
+            ],
+        })
+
+    return {"annee": annee, "mois": mois, "my_nom": my_nom, "jours": jours}
 
 # ==================== PLANNING — ORDRE DES ONGLETS ====================
 # Gestionnaire+ peut réorganiser la priorité d'affichage des trois vues
