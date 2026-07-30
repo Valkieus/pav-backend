@@ -444,6 +444,34 @@ class PlanningResponse(BaseModel):
     created_at: str
     updated_at: str
 
+# ---- Planning événement ----
+# Version allégée du planning mensuel (pas de tables/groupes/export PNG),
+# pour un événement ponctuel ou une courte série de jours en dehors du
+# rythme habituel vendredi/dimanche (ex: soirée spéciale un mardi). Même
+# convention de clé pour les affectations : "{role_key}_{slotIdx}" -> liste
+# de noms, un par date de la plage (dans l'ordre de `dates`).
+class PlanningEvenementCreate(BaseModel):
+    titre: str
+    date_debut: str  # YYYY-MM-DD
+    date_fin: str    # YYYY-MM-DD
+    roles: Optional[List[dict]] = []   # [{key, label, slots}]
+    affectations: Optional[dict] = {}  # {role_key_slotIdx: [nom par date]}
+    notes: Optional[str] = None
+
+class PlanningEvenementResponse(BaseModel):
+    id: str
+    titre: str
+    date_debut: str
+    date_fin: str
+    dates: List[str]
+    roles: List[dict] = []
+    affectations: dict = {}
+    notes: Optional[str] = None
+    is_archived: bool
+    created_at: str
+    updated_at: str
+    created_by_name: Optional[str] = None
+
 class ResetPasswordRequest(BaseModel):
     new_password: str
 
@@ -2984,6 +3012,185 @@ async def archive_planning(planning_id: str, current_user: dict = Depends(get_cu
         raise HTTPException(status_code=404, detail="Planning non trouvé")
     await log_action(current_user['id'], current_user['full_name'], "Archivage planning", f"Planning archivé: {planning_id}")
     return {"message": "Planning archivé"}
+
+# ==================== PLANNING ÉVÉNEMENTS ====================
+# Plannings ponctuels/exceptionnels en dehors du rythme mensuel vendredi/
+# dimanche — mêmes droits d'écriture que le planning équipe (Gestionnaire+),
+# lecture ouverte à tous les comptes connectés.
+
+def _date_range_inclusive(date_debut: str, date_fin: str) -> List[str]:
+    d0 = datetime.strptime(date_debut, "%Y-%m-%d").date()
+    d1 = datetime.strptime(date_fin, "%Y-%m-%d").date()
+    if d1 < d0:
+        d0, d1 = d1, d0
+    out = []
+    cur = d0
+    while cur <= d1:
+        out.append(cur.isoformat())
+        cur += timedelta(days=1)
+    return out
+
+@api_router.get("/planning-evenements", response_model=List[PlanningEvenementResponse])
+async def get_planning_evenements(include_archived: bool = False, current_user: dict = Depends(get_current_user)):
+    query = {} if include_archived else {"is_archived": False}
+    evs = await db.planning_evenements.find(query, {"_id": 0}).sort("date_debut", -1).to_list(200)
+    return [PlanningEvenementResponse(**e) for e in evs]
+
+@api_router.get("/planning-evenements/{evenement_id}", response_model=PlanningEvenementResponse)
+async def get_planning_evenement(evenement_id: str, current_user: dict = Depends(get_current_user)):
+    ev = await db.planning_evenements.find_one({"id": evenement_id}, {"_id": 0})
+    if not ev:
+        raise HTTPException(status_code=404, detail="Événement non trouvé")
+    return PlanningEvenementResponse(**ev)
+
+@api_router.post("/planning-evenements", response_model=PlanningEvenementResponse)
+async def create_planning_evenement(data: PlanningEvenementCreate, current_user: dict = Depends(get_current_user)):
+    await check_access_or_permission(current_user, ["Super Admin", "Responsable", "Gestionnaire"], "planning.write")
+    if not data.titre.strip():
+        raise HTTPException(status_code=400, detail="Titre requis")
+    if data.date_fin < data.date_debut:
+        raise HTTPException(status_code=400, detail="La date de fin doit être après la date de début")
+    dates = _date_range_inclusive(data.date_debut, data.date_fin)
+    evenement = {
+        "id": str(uuid.uuid4()),
+        "titre": data.titre.strip(),
+        "date_debut": data.date_debut,
+        "date_fin": data.date_fin,
+        "dates": dates,
+        "roles": data.roles or [],
+        "affectations": data.affectations or {},
+        "notes": data.notes,
+        "is_archived": False,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "created_by_name": current_user['full_name'],
+    }
+    await db.planning_evenements.insert_one(evenement)
+    await log_action(current_user['id'], current_user['full_name'], "Création planning événement",
+                      f"{evenement['titre']} ({data.date_debut} → {data.date_fin})")
+    return PlanningEvenementResponse(**evenement)
+
+@api_router.put("/planning-evenements/{evenement_id}", response_model=PlanningEvenementResponse)
+async def update_planning_evenement(evenement_id: str, data: PlanningEvenementCreate, current_user: dict = Depends(get_current_user)):
+    await check_access_or_permission(current_user, ["Super Admin", "Responsable", "Gestionnaire"], "planning.write")
+    if not data.titre.strip():
+        raise HTTPException(status_code=400, detail="Titre requis")
+    if data.date_fin < data.date_debut:
+        raise HTTPException(status_code=400, detail="La date de fin doit être après la date de début")
+    dates = _date_range_inclusive(data.date_debut, data.date_fin)
+    update_data = {
+        "titre": data.titre.strip(),
+        "date_debut": data.date_debut,
+        "date_fin": data.date_fin,
+        "dates": dates,
+        "roles": data.roles or [],
+        "affectations": data.affectations or {},
+        "notes": data.notes,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    result = await db.planning_evenements.update_one({"id": evenement_id}, {"$set": update_data})
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Événement non trouvé")
+    await log_action(current_user['id'], current_user['full_name'], "Modification planning événement", update_data["titre"])
+    ev = await db.planning_evenements.find_one({"id": evenement_id}, {"_id": 0})
+    return PlanningEvenementResponse(**ev)
+
+@api_router.put("/planning-evenements/{evenement_id}/archive")
+async def archive_planning_evenement(evenement_id: str, current_user: dict = Depends(get_current_user)):
+    await check_access_or_permission(current_user, ["Super Admin"], "planning.delete")
+    result = await db.planning_evenements.update_one({"id": evenement_id}, {"$set": {"is_archived": True, "updated_at": datetime.now(timezone.utc).isoformat()}})
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Événement non trouvé")
+    await log_action(current_user['id'], current_user['full_name'], "Archivage planning événement", evenement_id)
+    return {"message": "Événement archivé"}
+
+# ==================== VUE JOURNALIÈRE ("Mon planning") ====================
+# Combine, pour une date précise, les affectations issues du planning équipe
+# mensuel (si cette date tombe un vendredi/dimanche déjà planifié) et de tout
+# planning événement qui la couvre — support de la vue "qui est en service
+# aujourd'hui" et du filtre "juste moi".
+
+@api_router.get("/planning/jour/{date}")
+async def get_planning_jour(date: str, current_user: dict = Depends(get_current_user)):
+    try:
+        d = datetime.strptime(date, "%Y-%m-%d").date()
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Date invalide (YYYY-MM-DD attendu)")
+
+    roster = []
+
+    monthly = await db.planning.find_one({"annee": d.year, "mois": d.month, "is_archived": False}, {"_id": 0})
+    if monthly:
+        day_dates = monthly.get("dates") or {}
+        affectations = monthly.get("affectations") or {}
+        sections = monthly.get("sections") or {}
+        for day_key, day_label in (("dimanche", "Dimanche"), ("vendredi", "Vendredi")):
+            lst = day_dates.get(day_key) or []
+            if date not in lst:
+                continue
+            date_idx = lst.index(date)
+            day_sections = sections.get(day_key) or {}
+            for table_key in ("table1", "table2"):
+                for section in (day_sections.get(table_key) or []):
+                    section_name = section.get("name", "")
+                    for role in (section.get("roles") or []):
+                        role_key = role.get("key")
+                        slots = role.get("slots", 1)
+                        if not role_key:
+                            continue
+                        for slot_idx in range(slots):
+                            key = f"{role_key}_{slot_idx}"
+                            vals = affectations.get(key) or []
+                            nom = vals[date_idx] if date_idx < len(vals) else None
+                            if nom:
+                                roster.append({
+                                    "source": "equipe",
+                                    "source_label": day_label,
+                                    "section": section_name,
+                                    "role_label": role.get("label", role_key),
+                                    "nom": nom,
+                                })
+
+    events = await db.planning_evenements.find(
+        {"is_archived": False, "date_debut": {"$lte": date}, "date_fin": {"$gte": date}},
+        {"_id": 0}
+    ).to_list(50)
+    for ev in events:
+        ev_dates = ev.get("dates") or []
+        if date not in ev_dates:
+            continue
+        date_idx = ev_dates.index(date)
+        ev_affectations = ev.get("affectations") or {}
+        for role in (ev.get("roles") or []):
+            role_key = role.get("key")
+            slots = role.get("slots", 1)
+            if not role_key:
+                continue
+            for slot_idx in range(slots):
+                key = f"{role_key}_{slot_idx}"
+                vals = ev_affectations.get(key) or []
+                nom = vals[date_idx] if date_idx < len(vals) else None
+                if nom:
+                    roster.append({
+                        "source": "evenement",
+                        "source_label": ev.get("titre"),
+                        "section": ev.get("titre"),
+                        "role_label": role.get("label", role_key),
+                        "nom": nom,
+                    })
+
+    my_nom = None
+    if current_user.get("technicien_id"):
+        tech = await db.techniciens.find_one({"id": current_user["technicien_id"]}, {"_id": 0, "nom": 1})
+        my_nom = (tech or {}).get("nom")
+
+    jours = ["Lundi", "Mardi", "Mercredi", "Jeudi", "Vendredi", "Samedi", "Dimanche"]
+    return {
+        "date": date,
+        "jour_semaine": jours[d.weekday()],
+        "roster": roster,
+        "my_nom": my_nom,
+    }
 
 # ==================== ABSENCES ROUTES ====================
 # Self-service absence declarations. Any authenticated user can declare their
