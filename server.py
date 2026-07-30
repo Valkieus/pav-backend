@@ -3172,6 +3172,32 @@ def _build_roster_for_date(date_str: str, monthly: Optional[dict], events: list)
                     })
     return roster
 
+async def _resolve_my_nom(current_user: dict) -> Optional[str]:
+    """Retrouve le nom Effectif de l'utilisateur connecté. La plupart des
+    comptes créés par un Gestionnaire+ ne sont jamais explicitement liés à
+    une fiche technicien (technicien_id), même quand une fiche du même nom
+    existe bien dans l'Effectif — on se rabat donc sur une correspondance de
+    nom insensible à la casse (même logique que la validation de badge) et on
+    persiste le lien une fois trouvé pour accélérer les prochains appels."""
+    technicien_id = current_user.get("technicien_id")
+    if technicien_id:
+        tech = await db.techniciens.find_one({"id": technicien_id}, {"_id": 0, "nom": 1})
+        if tech and tech.get("nom"):
+            return tech["nom"]
+
+    full_name = (current_user.get('full_name') or '').strip()
+    if not full_name:
+        return None
+    tech = await db.techniciens.find_one(
+        {"nom": {"$regex": f"^{re.escape(full_name)}$", "$options": "i"}, "is_archived": False},
+        {"_id": 0, "id": 1, "nom": 1}
+    )
+    if not tech:
+        return None
+    if not technicien_id:
+        await db.users.update_one({"id": current_user["id"]}, {"$set": {"technicien_id": tech["id"]}})
+    return tech.get("nom")
+
 @api_router.get("/planning/jour/{date}")
 async def get_planning_jour(date: str, current_user: dict = Depends(get_current_user)):
     try:
@@ -3186,10 +3212,7 @@ async def get_planning_jour(date: str, current_user: dict = Depends(get_current_
     ).to_list(50)
     roster = _build_roster_for_date(date, monthly, events)
 
-    my_nom = None
-    if current_user.get("technicien_id"):
-        tech = await db.techniciens.find_one({"id": current_user["technicien_id"]}, {"_id": 0, "nom": 1})
-        my_nom = (tech or {}).get("nom")
+    my_nom = await _resolve_my_nom(current_user)
 
     jours = ["Lundi", "Mardi", "Mercredi", "Jeudi", "Vendredi", "Samedi", "Dimanche"]
     return {
@@ -3207,10 +3230,7 @@ async def get_planning_mois(annee: int, mois: int, current_user: dict = Depends(
     if mois < 1 or mois > 12:
         raise HTTPException(status_code=400, detail="Mois invalide")
 
-    my_nom = None
-    if current_user.get("technicien_id"):
-        tech = await db.techniciens.find_one({"id": current_user["technicien_id"]}, {"_id": 0, "nom": 1})
-        my_nom = (tech or {}).get("nom")
+    my_nom = await _resolve_my_nom(current_user)
 
     if not my_nom:
         return {"annee": annee, "mois": mois, "my_nom": None, "jours": []}
