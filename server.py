@@ -3192,6 +3192,45 @@ async def get_planning_jour(date: str, current_user: dict = Depends(get_current_
         "my_nom": my_nom,
     }
 
+# ==================== PLANNING — ORDRE DES ONGLETS ====================
+# Gestionnaire+ peut réorganiser la priorité d'affichage des trois vues
+# (Mon planning / Planning équipe / Événements). L'onglet Événements se
+# masque automatiquement pour les autres niveaux tant qu'aucun planning
+# événement n'a été créé, pour ne pas encombrer l'interface avec un onglet
+# vide — Gestionnaire+ le voit toujours puisque c'est lui qui les crée.
+
+PLANNING_TAB_KEYS = {"mon-planning", "equipe", "evenements"}
+DEFAULT_PLANNING_TAB_ORDER = ["mon-planning", "equipe", "evenements"]
+
+async def _get_planning_tab_order() -> list:
+    doc = await db.settings.find_one({"_key": "planning_tab_order"}, {"_id": 0})
+    order = (doc or {}).get("order")
+    if isinstance(order, list) and set(order) == PLANNING_TAB_KEYS and len(order) == 3:
+        return order
+    return list(DEFAULT_PLANNING_TAB_ORDER)
+
+class PlanningTabOrderUpdate(BaseModel):
+    order: List[str]
+
+@api_router.get("/planning/meta")
+async def get_planning_meta(current_user: dict = Depends(get_current_user)):
+    order = await _get_planning_tab_order()
+    has_events = await db.planning_evenements.count_documents({"is_archived": False}) > 0
+    return {"tab_order": order, "has_events": has_events}
+
+@api_router.post("/planning/tab-order")
+async def set_planning_tab_order(data: PlanningTabOrderUpdate, current_user: dict = Depends(get_current_user)):
+    await check_access_or_permission(current_user, ["Super Admin", "Responsable", "Gestionnaire"], "planning.write")
+    if set(data.order) != PLANNING_TAB_KEYS or len(data.order) != 3:
+        raise HTTPException(status_code=400, detail="Ordre invalide")
+    await db.settings.update_one(
+        {"_key": "planning_tab_order"},
+        {"$set": {"_key": "planning_tab_order", "order": data.order}},
+        upsert=True,
+    )
+    await log_action(current_user['id'], current_user['full_name'], "Modification ordre onglets Planning", " → ".join(data.order))
+    return {"tab_order": data.order}
+
 # ==================== ABSENCES ROUTES ====================
 # Self-service absence declarations. Any authenticated user can declare their
 # own absence (date range + reason); Gestionnaire+ can see everyone's
