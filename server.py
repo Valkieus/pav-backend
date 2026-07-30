@@ -455,8 +455,10 @@ class PlanningEvenementCreate(BaseModel):
     titre: str
     date_debut: str  # YYYY-MM-DD
     date_fin: str    # YYYY-MM-DD
+    dates: Optional[List[str]] = None  # colonnes explicites ; si absent, calculées depuis date_debut/date_fin. Permet d'ajouter/retirer des dates librement (édition du nombre de colonnes) sans être limité à une plage continue.
     roles: Optional[List[dict]] = []   # [{key, label, slots}]
     affectations: Optional[dict] = {}  # {role_key_slotIdx: [nom par date]}
+    blocked_cells: Optional[dict] = {}  # {role_key_slotIdx: [bool par date]} — case grisée/indisponible
     notes: Optional[str] = None
 
 class PlanningEvenementResponse(BaseModel):
@@ -467,6 +469,7 @@ class PlanningEvenementResponse(BaseModel):
     dates: List[str]
     roles: List[dict] = []
     affectations: dict = {}
+    blocked_cells: dict = {}
     notes: Optional[str] = None
     is_archived: bool
     created_at: str
@@ -2903,11 +2906,23 @@ async def get_plannings(include_archived: bool = False, current_user: dict = Dep
     plannings = await db.planning.find(query, {"_id": 0}).sort([("annee", -1), ("mois", -1)]).to_list(100)
     return [PlanningResponse(**p) for p in plannings]
 
+def _is_past_month(annee: int, mois: int) -> bool:
+    now = datetime.now(timezone.utc)
+    return (annee, mois) < (now.year, now.month)
+
 @api_router.get("/planning/{annee}/{mois}", response_model=PlanningResponse)
 async def get_planning_by_month(annee: int, mois: int, current_user: dict = Depends(get_current_user)):
     planning = await db.planning.find_one({"annee": annee, "mois": mois}, {"_id": 0})
     if not planning:
         raise HTTPException(status_code=404, detail="Planning non trouvé")
+    # Une fois le mois terminé, toute absence renseignée par un technicien
+    # dans la grille est remise à 0 automatiquement (elle ne concerne plus
+    # que du passé) — vérifié paresseusement à chaque consultation plutôt que
+    # via un job planifié, l'hébergement gratuit ne garantissant pas de cron.
+    if _is_past_month(annee, mois) and any((planning.get("absences") or {}).values()):
+        cleared = {"dimanche": "", "vendredi": ""}
+        await db.planning.update_one({"annee": annee, "mois": mois}, {"$set": {"absences": cleared}})
+        planning["absences"] = cleared
     return PlanningResponse(**planning)
 
 class PlanningScopeResponse(BaseModel):
@@ -3051,7 +3066,7 @@ async def create_planning_evenement(data: PlanningEvenementCreate, current_user:
         raise HTTPException(status_code=400, detail="Titre requis")
     if data.date_fin < data.date_debut:
         raise HTTPException(status_code=400, detail="La date de fin doit être après la date de début")
-    dates = _date_range_inclusive(data.date_debut, data.date_fin)
+    dates = sorted(set(data.dates)) if data.dates else _date_range_inclusive(data.date_debut, data.date_fin)
     evenement = {
         "id": str(uuid.uuid4()),
         "titre": data.titre.strip(),
@@ -3060,6 +3075,7 @@ async def create_planning_evenement(data: PlanningEvenementCreate, current_user:
         "dates": dates,
         "roles": data.roles or [],
         "affectations": data.affectations or {},
+        "blocked_cells": data.blocked_cells or {},
         "notes": data.notes,
         "is_archived": False,
         "created_at": datetime.now(timezone.utc).isoformat(),
@@ -3078,7 +3094,7 @@ async def update_planning_evenement(evenement_id: str, data: PlanningEvenementCr
         raise HTTPException(status_code=400, detail="Titre requis")
     if data.date_fin < data.date_debut:
         raise HTTPException(status_code=400, detail="La date de fin doit être après la date de début")
-    dates = _date_range_inclusive(data.date_debut, data.date_fin)
+    dates = sorted(set(data.dates)) if data.dates else _date_range_inclusive(data.date_debut, data.date_fin)
     update_data = {
         "titre": data.titre.strip(),
         "date_debut": data.date_debut,
@@ -3086,6 +3102,7 @@ async def update_planning_evenement(evenement_id: str, data: PlanningEvenementCr
         "dates": dates,
         "roles": data.roles or [],
         "affectations": data.affectations or {},
+        "blocked_cells": data.blocked_cells or {},
         "notes": data.notes,
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
@@ -3288,19 +3305,18 @@ async def get_planning_mois(annee: int, mois: int, current_user: dict = Depends(
     return {"annee": annee, "mois": mois, "my_nom": my_nom, "jours": jours}
 
 # ==================== PLANNING — ORDRE DES ONGLETS ====================
-# Gestionnaire+ peut réorganiser la priorité d'affichage des trois vues
-# (Mon planning / Planning équipe / Événements). L'onglet Événements se
-# masque automatiquement pour les autres niveaux tant qu'aucun planning
-# événement n'a été créé, pour ne pas encombrer l'interface avec un onglet
-# vide — Gestionnaire+ le voit toujours puisque c'est lui qui les crée.
+# Gestionnaire+ peut réorganiser la priorité d'affichage des deux vues
+# (Mon planning / Planning générale). Les plannings événements ne sont plus
+# un onglet séparé : ils se créent et se gèrent depuis un bouton "Planning
+# événement" à l'intérieur de Planning générale (cf. /planning-evenements).
 
-PLANNING_TAB_KEYS = {"mon-planning", "equipe", "evenements"}
-DEFAULT_PLANNING_TAB_ORDER = ["mon-planning", "equipe", "evenements"]
+PLANNING_TAB_KEYS = {"mon-planning", "equipe"}
+DEFAULT_PLANNING_TAB_ORDER = ["mon-planning", "equipe"]
 
 async def _get_planning_tab_order() -> list:
     doc = await db.settings.find_one({"_key": "planning_tab_order"}, {"_id": 0})
     order = (doc or {}).get("order")
-    if isinstance(order, list) and set(order) == PLANNING_TAB_KEYS and len(order) == 3:
+    if isinstance(order, list) and set(order) == PLANNING_TAB_KEYS and len(order) == 2:
         return order
     return list(DEFAULT_PLANNING_TAB_ORDER)
 
@@ -3310,13 +3326,12 @@ class PlanningTabOrderUpdate(BaseModel):
 @api_router.get("/planning/meta")
 async def get_planning_meta(current_user: dict = Depends(get_current_user)):
     order = await _get_planning_tab_order()
-    has_events = await db.planning_evenements.count_documents({"is_archived": False}) > 0
-    return {"tab_order": order, "has_events": has_events}
+    return {"tab_order": order}
 
 @api_router.post("/planning/tab-order")
 async def set_planning_tab_order(data: PlanningTabOrderUpdate, current_user: dict = Depends(get_current_user)):
     await check_access_or_permission(current_user, ["Super Admin", "Responsable", "Gestionnaire"], "planning.write")
-    if set(data.order) != PLANNING_TAB_KEYS or len(data.order) != 3:
+    if set(data.order) != PLANNING_TAB_KEYS or len(data.order) != 2:
         raise HTTPException(status_code=400, detail="Ordre invalide")
     await db.settings.update_one(
         {"_key": "planning_tab_order"},
@@ -3334,6 +3349,15 @@ async def set_planning_tab_order(data: PlanningTabOrderUpdate, current_user: dic
 
 def _dates_overlap(a_start: str, a_end: str, b_start: str, b_end: str) -> bool:
     return a_start <= b_end and b_start <= a_end
+
+async def _purge_expired_absences():
+    """Une absence déclarée par un technicien est remise à 0 une fois son
+    mois passé : elle est purgée dès qu'elle est entièrement dans le passé
+    (date_fin avant le 1er du mois en cours), pour que "Mon espace" et la
+    liste Gestionnaire+ ne gardent jamais de déclarations obsolètes."""
+    today = datetime.now(timezone.utc)
+    month_start = f"{today.year:04d}-{today.month:02d}-01"
+    await db.absences.delete_many({"date_fin": {"$lt": month_start}})
 
 @api_router.post("/absences", response_model=AbsenceResponse)
 async def create_absence(data: AbsenceCreate, current_user: dict = Depends(get_current_user)):
@@ -3361,12 +3385,14 @@ async def create_absence(data: AbsenceCreate, current_user: dict = Depends(get_c
 
 @api_router.get("/absences/mine", response_model=List[AbsenceResponse])
 async def get_my_absences(current_user: dict = Depends(get_current_user)):
+    await _purge_expired_absences()
     absences = await db.absences.find({"user_id": current_user["id"]}, {"_id": 0}).sort("date_debut", 1).to_list(1000)
     return [AbsenceResponse(**a) for a in absences]
 
 @api_router.get("/absences", response_model=List[AbsenceResponse])
 async def get_absences(mois: Optional[int] = None, annee: Optional[int] = None, current_user: dict = Depends(get_current_user)):
     check_access(current_user, ["Super Admin", "Admin", "Responsable", "Gestionnaire"])
+    await _purge_expired_absences()
     absences = await db.absences.find({}, {"_id": 0}).sort("date_debut", 1).to_list(2000)
 
     if mois and annee:
