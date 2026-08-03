@@ -365,6 +365,10 @@ class ActualiteCreate(BaseModel):
     description: Optional[str] = None
     date_evenement: Optional[str] = None
     image_url: Optional[str] = None
+    # Un événement peut être marqué comme accueillant un invité — alimente le
+    # rappel "invités ce mois" sur le Dashboard de tous les utilisateurs.
+    invite: bool = False
+    invite_nom: Optional[str] = None
 
 class ActualiteResponse(BaseModel):
     id: str
@@ -372,6 +376,8 @@ class ActualiteResponse(BaseModel):
     description: Optional[str] = None
     date_evenement: Optional[str] = None
     image_url: Optional[str] = None
+    invite: bool = False
+    invite_nom: Optional[str] = None
     created_by: str
     created_by_name: str
     created_at: str
@@ -442,6 +448,11 @@ class PlanningResponse(BaseModel):
     blocked_cells: Optional[dict] = None
     titre_overrides: Optional[dict] = None
     date_labels: Optional[dict] = None
+    # Un planning créé/modifié par un Responsable+ démarre en brouillon —
+    # invisible pour les Techniciens tant qu'un Gestionnaire+ ne clique pas
+    # "Publier". Absent des documents créés avant cette fonctionnalité ->
+    # défaut True (rétro-compatible, rien de déjà visible ne disparaît).
+    is_published: bool = True
     is_archived: bool
     created_at: str
     updated_at: str
@@ -2957,11 +2968,21 @@ def _is_past_month(annee: int, mois: int) -> bool:
     now = datetime.now(timezone.utc)
     return (annee, mois) < (now.year, now.month)
 
+def _planning_hidden_for_user(planning: dict, current_user: dict) -> bool:
+    """Un planning en brouillon (is_published=False) reste invisible pour les
+    Techniciens — Responsable et au-dessus (dont Admin (lecture seule), qui
+    voit toujours tout) voient le brouillon en cours d'édition."""
+    if current_user.get("niveau_acces") != "Technicien":
+        return False
+    return not planning.get("is_published", True)
+
 @api_router.get("/planning/{annee}/{mois}", response_model=PlanningResponse)
 async def get_planning_by_month(annee: int, mois: int, current_user: dict = Depends(get_current_user)):
     planning = await db.planning.find_one({"annee": annee, "mois": mois}, {"_id": 0})
     if not planning:
         raise HTTPException(status_code=404, detail="Planning non trouvé")
+    if _planning_hidden_for_user(planning, current_user):
+        raise HTTPException(status_code=404, detail="not_published")
     # Une fois le mois terminé, toute absence renseignée par un technicien
     # dans la grille est remise à 0 automatiquement (elle ne concerne plus
     # que du passé) — vérifié paresseusement à chaque consultation plutôt que
@@ -3013,6 +3034,9 @@ async def create_planning(data: PlanningCreate, current_user: dict = Depends(get
         "blocked_cells": data.blocked_cells,
         "titre_overrides": data.titre_overrides,
         "date_labels": data.date_labels,
+        # Nouveau planning = brouillon par défaut, invisible pour les
+        # Techniciens tant qu'un Gestionnaire+ ne l'a pas publié.
+        "is_published": False,
         "is_archived": False,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "updated_at": datetime.now(timezone.utc).isoformat()
@@ -3060,11 +3084,34 @@ async def update_planning(planning_id: str, data: PlanningCreate, current_user: 
         "date_labels": data.date_labels,
         "updated_at": datetime.now(timezone.utc).isoformat()
     }
+    # matched_count (pas modified_count) : un autosave qui renvoie exactement
+    # les mêmes données que déjà en base ne modifie rien mais ne doit
+    # surtout pas être traité comme "planning introuvable".
     result = await db.planning.update_one({"id": planning_id}, {"$set": update_data})
-    if result.modified_count == 0:
+    if result.matched_count == 0:
         raise HTTPException(status_code=404, detail="Planning non trouvé")
     planning = await db.planning.find_one({"id": planning_id}, {"_id": 0})
     await log_action(current_user['id'], current_user['full_name'], "Modification planning", f"Planning modifié: {data.mois}/{data.annee}")
+    return PlanningResponse(**planning)
+
+@api_router.put("/planning/{planning_id}/publish", response_model=PlanningResponse)
+async def publish_planning(planning_id: str, current_user: dict = Depends(get_current_user)):
+    check_access(current_user, ["Super Admin", "Admin", "Gestionnaire"])
+    result = await db.planning.update_one({"id": planning_id}, {"$set": {"is_published": True, "updated_at": datetime.now(timezone.utc).isoformat()}})
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Planning non trouvé")
+    planning = await db.planning.find_one({"id": planning_id}, {"_id": 0})
+    await log_action(current_user['id'], current_user['full_name'], "Publication planning", f"Planning {planning.get('mois')}/{planning.get('annee')} publié — visible pour les Techniciens")
+    return PlanningResponse(**planning)
+
+@api_router.put("/planning/{planning_id}/unpublish", response_model=PlanningResponse)
+async def unpublish_planning(planning_id: str, current_user: dict = Depends(get_current_user)):
+    check_access(current_user, ["Super Admin", "Admin", "Gestionnaire"])
+    result = await db.planning.update_one({"id": planning_id}, {"$set": {"is_published": False, "updated_at": datetime.now(timezone.utc).isoformat()}})
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Planning non trouvé")
+    planning = await db.planning.find_one({"id": planning_id}, {"_id": 0})
+    await log_action(current_user['id'], current_user['full_name'], "Dépublication planning", f"Planning {planning.get('mois')}/{planning.get('annee')} repassé en brouillon")
     return PlanningResponse(**planning)
 
 @api_router.put("/planning/{planning_id}/archive")
@@ -3281,6 +3328,8 @@ async def get_planning_jour(date: str, current_user: dict = Depends(get_current_
         raise HTTPException(status_code=400, detail="Date invalide (YYYY-MM-DD attendu)")
 
     monthly = await db.planning.find_one({"annee": d.year, "mois": d.month, "is_archived": False}, {"_id": 0})
+    if monthly and _planning_hidden_for_user(monthly, current_user):
+        monthly = None  # brouillon non publié : invisible pour un Technicien
     events = await db.planning_evenements.find(
         {"is_archived": False, "date_debut": {"$lte": date}, "date_fin": {"$gte": date}},
         {"_id": 0}
@@ -3311,6 +3360,8 @@ async def get_planning_mois(annee: int, mois: int, current_user: dict = Depends(
         return {"annee": annee, "mois": mois, "my_nom": None, "jours": []}
 
     monthly = await db.planning.find_one({"annee": annee, "mois": mois, "is_archived": False}, {"_id": 0})
+    if monthly and _planning_hidden_for_user(monthly, current_user):
+        monthly = None  # brouillon non publié : invisible pour un Technicien
 
     first_day = f"{annee:04d}-{mois:02d}-01"
     last_day_num = calendar.monthrange(annee, mois)[1]
@@ -3406,6 +3457,41 @@ async def _purge_expired_absences():
     month_start = f"{today.year:04d}-{today.month:02d}-01"
     await db.absences.delete_many({"date_fin": {"$lt": month_start}})
 
+async def _append_absence_to_planning_notes(full_name: str, date_debut: str, date_fin: str, raison: str):
+    """En plus de la notification/bannière Gestionnaire+ existante, inscrit
+    l'absence directement dans le champ "Absences de l'équipe" (texte libre,
+    par jour dimanche/vendredi) du ou des plannings mensuels concernés, pour
+    qu'elle reste visible même sans ouvrir la liste dédiée. N'agit que sur un
+    planning déjà créé pour le mois — ne crée jamais de planning juste pour
+    ça (cohérent avec le reste du module : seul un Responsable+ à contrôle
+    total initie un nouveau mois)."""
+    try:
+        start = datetime.strptime(date_debut, "%Y-%m-%d").date()
+        end = datetime.strptime(date_fin, "%Y-%m-%d").date()
+    except ValueError:
+        return
+    marker = f"{full_name} — absent du {date_debut} au {date_fin}"
+    line = f"{marker} ({raison})" if raison else marker
+    months = set()
+    cur = start.replace(day=1)
+    while (cur.year, cur.month) <= (end.year, end.month):
+        months.add((cur.year, cur.month))
+        cur = (cur.replace(day=28) + timedelta(days=4)).replace(day=1)
+    for (yr, mo) in months:
+        planning = await db.planning.find_one({"annee": yr, "mois": mo, "is_archived": False}, {"_id": 0})
+        if not planning:
+            continue
+        absences_field = dict(planning.get("absences") or {})
+        changed = False
+        for day_key in ("dimanche", "vendredi"):
+            existing = absences_field.get(day_key) or ""
+            if marker in existing:
+                continue
+            absences_field[day_key] = f"{existing}\n{line}".strip() if existing else line
+            changed = True
+        if changed:
+            await db.planning.update_one({"id": planning["id"]}, {"$set": {"absences": absences_field, "updated_at": datetime.now(timezone.utc).isoformat()}})
+
 @api_router.post("/absences", response_model=AbsenceResponse)
 async def create_absence(data: AbsenceCreate, current_user: dict = Depends(get_current_user)):
     if data.date_fin < data.date_debut:
@@ -3428,6 +3514,7 @@ async def create_absence(data: AbsenceCreate, current_user: dict = Depends(get_c
         f"{current_user['full_name']} sera absent(e) du {data.date_debut} au {data.date_fin} ({data.raison}).",
         link="/planning"
     )
+    await _append_absence_to_planning_notes(current_user['full_name'], data.date_debut, data.date_fin, data.raison)
     return AbsenceResponse(**{k: v for k, v in absence.items() if k != "_id"})
 
 @api_router.get("/absences/mine", response_model=List[AbsenceResponse])
@@ -3502,6 +3589,8 @@ async def create_actualite(data: ActualiteCreate, current_user: dict = Depends(g
         "description": data.description,
         "date_evenement": data.date_evenement,
         "image_url": data.image_url,
+        "invite": data.invite,
+        "invite_nom": data.invite_nom if data.invite else None,
         "created_by": current_user['id'],
         "created_by_name": current_user['full_name'],
         "created_at": datetime.now(timezone.utc).isoformat(),
@@ -3519,6 +3608,8 @@ async def update_actualite(actualite_id: str, data: ActualiteCreate, current_use
         "description": data.description,
         "date_evenement": data.date_evenement,
         "image_url": data.image_url,
+        "invite": data.invite,
+        "invite_nom": data.invite_nom if data.invite else None,
         "updated_at": datetime.now(timezone.utc).isoformat()
     }
     result = await db.actualites.update_one({"id": actualite_id}, {"$set": update_data})
@@ -3793,11 +3884,79 @@ async def get_member_brief(current_user: dict = Depends(get_current_user)):
 
     formations_catalogue_count = await db.formations.count_documents({"is_archived": False, "disponible_catalogue": True})
 
+    # "Tu es de service X ce mois d'août" / "Tu n'es pas planifié(e)
+    # prochainement pour ce mois d'août" — même logique de correspondance de
+    # nom que upcoming_shifts ci-dessus, mais restreinte au mois en cours et
+    # enrichie du libellé de poste (via les "sections" persistées sur le
+    # planning du mois), respectant aussi le statut publié/brouillon.
+    mois_noms_fr = ["janvier", "février", "mars", "avril", "mai", "juin",
+                     "juillet", "août", "septembre", "octobre", "novembre", "décembre"]
+    current_month_name = mois_noms_fr[now.month - 1]
+    my_role_labels = []
+    current_planning = await db.planning.find_one({"annee": now.year, "mois": now.month, "is_archived": False}, {"_id": 0})
+    if current_planning and _planning_hidden_for_user(current_planning, current_user):
+        current_planning = None
+    if current_planning:
+        day_dates_map = current_planning.get('dates') or {}
+        sections_map = current_planning.get('sections') or {}
+        affectations_map = current_planning.get('affectations') or {}
+        for day_type in ['vendredi', 'dimanche']:
+            day_dates = day_dates_map.get(day_type) or []
+            if not day_dates:
+                continue
+            day_sections = sections_map.get(day_type) or {}
+            for table_key in ('table1', 'table2'):
+                for section in (day_sections.get(table_key) or []):
+                    for role in (section.get('roles') or []):
+                        role_key = role.get('key')
+                        slots = role.get('slots', 1)
+                        if not role_key:
+                            continue
+                        for slot_idx in range(slots):
+                            vals = affectations_map.get(f"{role_key}_{slot_idx}") or {}
+                            items = enumerate(vals) if isinstance(vals, list) else vals.items()
+                            for idx_key, value in items:
+                                try:
+                                    idx = int(idx_key)
+                                except (TypeError, ValueError):
+                                    continue
+                                if idx < 0 or idx >= len(day_dates) or not _name_matches(value):
+                                    continue
+                                if day_dates[idx] < today_str:
+                                    continue
+                                label = role.get('label', role_key)
+                                if label not in my_role_labels:
+                                    my_role_labels.append(label)
+    if my_role_labels:
+        service_status_text = f"Tu es de service {', '.join(my_role_labels)} ce mois de {current_month_name}."
+    else:
+        service_status_text = f"Tu n'es pas planifié(e) prochainement pour ce mois de {current_month_name}."
+
+    # "Nous avons N invité(s) prochainement pour le mois d'août" — événements
+    # Actualités marqués "invité" dont la date tombe ce mois-ci, pas encore
+    # passée.
+    month_prefix = f"{now.year:04d}-{now.month:02d}"
+    upcoming_guests = [
+        a for a in actualites
+        if a.get('invite') and a.get('date_evenement')
+        and a['date_evenement'] >= today_str
+        and a['date_evenement'].startswith(month_prefix)
+    ]
+    if upcoming_guests:
+        noms = [g.get('invite_nom') for g in upcoming_guests if g.get('invite_nom')]
+        suffix = f" ({', '.join(noms)})" if noms else ""
+        plural = "s" if len(upcoming_guests) > 1 else ""
+        guests_status_text = f"Nous avons {len(upcoming_guests)} invité{plural} prochainement pour le mois de {current_month_name}{suffix}."
+    else:
+        guests_status_text = f"Nous n'avons pas d'invités prochainement pour le mois de {current_month_name}."
+
     return {
         "upcoming_shifts": upcoming_shifts,
         "upcoming_events": [{"titre": e['titre'], "date_evenement": e['date_evenement']} for e in upcoming_events],
         "formations_catalogue_count": formations_catalogue_count,
         "service_info_text": await get_service_info_text(),
+        "service_status_text": service_status_text,
+        "guests_status_text": guests_status_text,
     }
 
 # ==================== ORGANIGRAMME ====================
