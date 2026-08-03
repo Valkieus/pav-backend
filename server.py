@@ -435,6 +435,10 @@ class PlanningCreate(BaseModel):
     # Texte libre affiché sous une date précise (ex: nom d'invité, "Fête des
     # pères"), ex: {"dimanche": {"2026-06-14": "Invité : Jonathan Stockstill"}}.
     date_labels: Optional[dict] = None
+    # Casse d'affichage des noms assignés sur ce planning (préférence
+    # Gestionnaire+, purement visuelle — ne modifie jamais le nom stocké/tapé
+    # dans la fiche Effectif) : "normal" | "upper" | "lower" | "capitalize".
+    affichage_noms: Optional[str] = 'normal'
 
 class PlanningResponse(BaseModel):
     id: str
@@ -448,6 +452,7 @@ class PlanningResponse(BaseModel):
     blocked_cells: Optional[dict] = None
     titre_overrides: Optional[dict] = None
     date_labels: Optional[dict] = None
+    affichage_noms: Optional[str] = 'normal'
     # Un planning créé/modifié par un Responsable+ démarre en brouillon —
     # invisible pour les Techniciens tant qu'un Gestionnaire+ ne clique pas
     # "Publier". Absent des documents créés avant cette fonctionnalité ->
@@ -1989,6 +1994,22 @@ async def get_technicien(tech_id: str, current_user: dict = Depends(get_current_
         raise HTTPException(status_code=404, detail="Technicien introuvable")
     return TechnicienResponse(**normalize_technicien(tech))
 
+def _sanitize_postes(payload: dict) -> dict:
+    """postes_secondaires should never repeat poste_principal, or contain
+    duplicates — otherwise a technicien ends up listed twice for the same
+    poste in the Planning assignment dropdown (e.g. two "Angelo" entries)."""
+    principal = payload.get("poste_principal")
+    secondaires = payload.get("postes_secondaires") or []
+    seen = set()
+    cleaned = []
+    for p in secondaires:
+        if not p or p == principal or p in seen:
+            continue
+        seen.add(p)
+        cleaned.append(p)
+    payload["postes_secondaires"] = cleaned
+    return payload
+
 @api_router.post("/techniciens", response_model=TechnicienResponse)
 async def create_technicien(data: TechnicienCreate, current_user: dict = Depends(get_current_user)):
     await check_access_or_permission(current_user, ["Super Admin", "Admin", "Responsable"], "effectif.write")
@@ -1998,7 +2019,7 @@ async def create_technicien(data: TechnicienCreate, current_user: dict = Depends
     is_responsable_submission = current_user['niveau_acces'] == "Responsable"
     tech = {
         "id": str(uuid.uuid4()),
-        **data.model_dump(),
+        **_sanitize_postes(data.model_dump()),
         "is_archived": False,
         "is_pending_approval": is_responsable_submission,
         "proposed_by": current_user['id'] if is_responsable_submission else None,
@@ -2058,12 +2079,12 @@ async def reject_technicien(tech_id: str, data: TechnicienRejectRequest, current
 @api_router.put("/techniciens/{tech_id}", response_model=TechnicienResponse)
 async def update_technicien(tech_id: str, data: TechnicienCreate, current_user: dict = Depends(get_current_user)):
     await check_access_or_permission(current_user, ["Super Admin", "Admin", "Responsable"], "effectif.write")
-    update_data = data.model_dump()
+    update_data = _sanitize_postes(data.model_dump())
     update_data["updated_at"] = datetime.now(timezone.utc).isoformat()
     # Remove old branche field if it exists
     await db.techniciens.update_one({"id": tech_id}, {"$unset": {"branche": ""}})
     result = await db.techniciens.update_one({"id": tech_id}, {"$set": update_data})
-    if result.modified_count == 0:
+    if result.matched_count == 0:
         raise HTTPException(status_code=404, detail="Technicien non trouvé")
     tech = await db.techniciens.find_one({"id": tech_id}, {"_id": 0})
     await log_action(current_user['id'], current_user['full_name'], "Modification technicien", f"Technicien modifié: {data.nom}")
@@ -3034,6 +3055,7 @@ async def create_planning(data: PlanningCreate, current_user: dict = Depends(get
         "blocked_cells": data.blocked_cells,
         "titre_overrides": data.titre_overrides,
         "date_labels": data.date_labels,
+        "affichage_noms": data.affichage_noms or 'normal',
         # Nouveau planning = brouillon par défaut, invisible pour les
         # Techniciens tant qu'un Gestionnaire+ ne l'a pas publié.
         "is_published": False,
@@ -3059,7 +3081,7 @@ async def update_planning(planning_id: str, data: PlanningCreate, current_user: 
             # A scoped Responsable may only fill in affectation values within
             # their group's sections/postes — structural edits (categories,
             # dates, blocked cells, custom titles/labels) require full control.
-            structural_fields = ["sections", "dates", "blocked_cells", "titre_overrides", "date_labels"]
+            structural_fields = ["sections", "dates", "blocked_cells", "titre_overrides", "date_labels", "affichage_noms"]
             for field in structural_fields:
                 if getattr(data, field) != existing_check.get(field):
                     raise HTTPException(status_code=403, detail="Votre groupe ne permet pas de modifier la structure du planning (catégories, dates, libellés) — seulement les affectations de votre périmètre")
@@ -3082,6 +3104,7 @@ async def update_planning(planning_id: str, data: PlanningCreate, current_user: 
         "blocked_cells": data.blocked_cells,
         "titre_overrides": data.titre_overrides,
         "date_labels": data.date_labels,
+        "affichage_noms": data.affichage_noms or 'normal',
         "updated_at": datetime.now(timezone.utc).isoformat()
     }
     # matched_count (pas modified_count) : un autosave qui renvoie exactement
