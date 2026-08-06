@@ -373,6 +373,11 @@ class ActualiteCreate(BaseModel):
     titre: str
     description: Optional[str] = None
     date_evenement: Optional[str] = None
+    # Si renseigné, l'actualité couvre une PÉRIODE (date_evenement -> ce
+    # champ) plutôt qu'un jour unique — même logique que le choix "période
+    # vs jour unique" côté absences dans Mon espace. Laisser vide pour un
+    # événement ponctuel classique.
+    date_fin_evenement: Optional[str] = None
     image_url: Optional[str] = None
     # Un événement peut être marqué comme accueillant un invité — alimente le
     # rappel "invités ce mois" sur le Dashboard de tous les utilisateurs.
@@ -384,6 +389,7 @@ class ActualiteResponse(BaseModel):
     titre: str
     description: Optional[str] = None
     date_evenement: Optional[str] = None
+    date_fin_evenement: Optional[str] = None
     image_url: Optional[str] = None
     invite: bool = False
     invite_nom: Optional[str] = None
@@ -2160,6 +2166,9 @@ class BadgeUserResponse(BaseModel):
     badge_reviewed_by_name: Optional[str] = None
     badge_message: Optional[str] = None
     badge_motif: Optional[str] = None
+    # Archivage — sort la demande de la liste active sans effacer les
+    # données (réversible). La suppression définitive, elle, efface tout.
+    badge_archived: Optional[bool] = False
 
 @api_router.post("/me/badge")
 async def submit_my_badge_request(
@@ -2225,12 +2234,59 @@ async def submit_my_badge_request(
     return {"message": "Demande envoyée", "badge_status": "en_attente_validation", "badge_photo_url": photo_url}
 
 @api_router.get("/admin/badges", response_model=List[BadgeUserResponse])
-async def list_badge_requests(current_user: dict = Depends(get_current_user)):
+async def list_badge_requests(archived: bool = False, current_user: dict = Depends(get_current_user)):
     check_access(current_user, ["Gestionnaire", "Responsable", "Admin", "Super Admin"])
-    users = await db.users.find(
-        {"badge_status": {"$ne": None}}, {"_id": 0}
-    ).sort("badge_requested_at", -1).to_list(1000)
+    query = {"badge_status": {"$ne": None}, "badge_archived": True} if archived else \
+        {"badge_status": {"$ne": None}, "badge_archived": {"$ne": True}}
+    users = await db.users.find(query, {"_id": 0}).sort("badge_requested_at", -1).to_list(1000)
     return [BadgeUserResponse(**u) for u in users]
+
+@api_router.post("/admin/badges/{user_id}/archive")
+async def archive_badge_request(user_id: str, current_user: dict = Depends(get_current_user)):
+    """Sort une demande de badge de la liste active sans effacer les
+    données — réversible via /unarchive."""
+    check_access(current_user, ["Gestionnaire", "Responsable", "Admin", "Super Admin"])
+    target = await db.users.find_one({"id": user_id}, {"_id": 0})
+    if not target or not target.get("badge_status"):
+        raise HTTPException(status_code=404, detail="Demande de badge introuvable")
+    await db.users.update_one({"id": user_id}, {"$set": {"badge_archived": True}})
+    await log_action(current_user['id'], current_user['full_name'], "Archivage demande badge", target.get('full_name'))
+    return {"message": "Demande archivée"}
+
+@api_router.post("/admin/badges/{user_id}/unarchive")
+async def unarchive_badge_request(user_id: str, current_user: dict = Depends(get_current_user)):
+    check_access(current_user, ["Gestionnaire", "Responsable", "Admin", "Super Admin"])
+    target = await db.users.find_one({"id": user_id}, {"_id": 0})
+    if not target or not target.get("badge_status"):
+        raise HTTPException(status_code=404, detail="Demande de badge introuvable")
+    await db.users.update_one({"id": user_id}, {"$set": {"badge_archived": False}})
+    await log_action(current_user['id'], current_user['full_name'], "Désarchivage demande badge", target.get('full_name'))
+    return {"message": "Demande désarchivée"}
+
+@api_router.delete("/admin/badges/{user_id}")
+async def delete_badge_request(user_id: str, current_user: dict = Depends(get_current_user)):
+    """Supprime DÉFINITIVEMENT la demande/soumission de badge (photo,
+    statut, historique de revue) — irréversible. Ne touche pas au badge déjà
+    attribué sur la fiche Effectif (badge_attribue), qui reste indépendant :
+    ceci efface juste la demande, pas le fait que le badge physique a été
+    remis."""
+    check_access(current_user, ["Super Admin", "Admin"])
+    target = await db.users.find_one({"id": user_id}, {"_id": 0})
+    if not target or not target.get("badge_status"):
+        raise HTTPException(status_code=404, detail="Demande de badge introuvable")
+    await db.users.update_one({"id": user_id}, {"$set": {
+        "badge_status": None,
+        "badge_photo_url": None,
+        "badge_is_renewal": False,
+        "badge_requested_at": None,
+        "badge_reviewed_at": None,
+        "badge_reviewed_by_name": None,
+        "badge_message": None,
+        "badge_motif": None,
+        "badge_archived": False,
+    }})
+    await log_action(current_user['id'], current_user['full_name'], "Suppression définitive demande badge", target.get('full_name'))
+    return {"message": "Demande supprimée définitivement"}
 
 @api_router.post("/admin/badges/{user_id}/confirm")
 async def confirm_badge(user_id: str, current_user: dict = Depends(get_current_user)):
@@ -2272,7 +2328,11 @@ async def confirm_badge(user_id: str, current_user: dict = Depends(get_current_u
         "Votre badge a été validé.",
         link="/mon-espace"
     )
-    return {"message": "Badge validé"}
+    # fiche_updated indique si la fiche Effectif de la personne a bien été
+    # retrouvée et marquée "badge attribué" automatiquement. Si False, le
+    # frontend doit le signaler à qui valide pour qu'il/elle vérifie/coche
+    # ça manuellement sur la fiche.
+    return {"message": "Badge validé", "fiche_updated": bool(technicien_id), "technicien_id": technicien_id}
 
 @api_router.post("/admin/badges/{user_id}/reject")
 async def reject_badge(user_id: str, data: BadgeRejectRequest, current_user: dict = Depends(get_current_user)):
@@ -3826,14 +3886,23 @@ async def get_actualites_public():
     actualites = await db.actualites.find({"is_active": True}, {"_id": 0}).sort("created_at", -1).limit(5).to_list(5)
     return actualites
 
+def _validate_actualite_period(data: ActualiteCreate):
+    if data.date_fin_evenement:
+        if not data.date_evenement:
+            raise HTTPException(status_code=400, detail="Une date de début est requise pour une période")
+        if data.date_fin_evenement < data.date_evenement:
+            raise HTTPException(status_code=400, detail="La date de fin doit être après la date de début")
+
 @api_router.post("/actualites", response_model=ActualiteResponse)
 async def create_actualite(data: ActualiteCreate, current_user: dict = Depends(get_current_user)):
     await check_access_or_permission(current_user, ["Super Admin", "Admin", "Responsable", "Gestionnaire"], "actualites.write")
+    _validate_actualite_period(data)
     actualite = {
         "id": str(uuid.uuid4()),
         "titre": data.titre,
         "description": data.description,
         "date_evenement": data.date_evenement,
+        "date_fin_evenement": data.date_fin_evenement,
         "image_url": data.image_url,
         "invite": data.invite,
         "invite_nom": data.invite_nom if data.invite else None,
@@ -3849,10 +3918,12 @@ async def create_actualite(data: ActualiteCreate, current_user: dict = Depends(g
 @api_router.put("/actualites/{actualite_id}", response_model=ActualiteResponse)
 async def update_actualite(actualite_id: str, data: ActualiteCreate, current_user: dict = Depends(get_current_user)):
     await check_access_or_permission(current_user, ["Super Admin", "Admin", "Responsable", "Gestionnaire"], "actualites.write")
+    _validate_actualite_period(data)
     update_data = {
         "titre": data.titre,
         "description": data.description,
         "date_evenement": data.date_evenement,
+        "date_fin_evenement": data.date_fin_evenement,
         "image_url": data.image_url,
         "invite": data.invite,
         "invite_nom": data.invite_nom if data.invite else None,
@@ -4399,8 +4470,11 @@ async def get_member_brief(current_user: dict = Depends(get_current_user)):
     upcoming_shifts = deduped_shifts[:4]
 
     actualites = await db.actualites.find({"is_active": True}, {"_id": 0}).to_list(200)
+    # >= today_str sur la date de FIN (ou la date de début pour un événement
+    # ponctuel) pour qu'un événement sur plusieurs jours reste visible tant
+    # qu'il n'est pas terminé, même une fois son premier jour passé.
     upcoming_events = sorted(
-        [a for a in actualites if a.get('date_evenement') and a['date_evenement'] >= today_str],
+        [a for a in actualites if a.get('date_evenement') and (a.get('date_fin_evenement') or a['date_evenement']) >= today_str],
         key=lambda a: a['date_evenement']
     )[:3]
 
@@ -4466,11 +4540,15 @@ async def get_member_brief(current_user: dict = Depends(get_current_user)):
         except ValueError:
             _month_last_day -= 1
     month_end_str = f"{month_prefix}-{_month_last_day:02d}"
+    # Filtre par CHEVAUCHEMENT avec le mois (pas juste la date de début),
+    # pour qu'un événement sur plusieurs jours (période) reste pris en
+    # compte même s'il a commencé un autre mois ou avant aujourd'hui mais
+    # se poursuit encore.
     upcoming_guests = [
         a for a in actualites
         if a.get('invite') and a.get('date_evenement')
-        and a['date_evenement'] >= today_str
-        and a['date_evenement'].startswith(month_prefix)
+        and (a.get('date_fin_evenement') or a['date_evenement']) >= today_str
+        and _dates_overlap(a['date_evenement'], a.get('date_fin_evenement') or a['date_evenement'], f"{month_prefix}-01", month_end_str)
     ]
     if upcoming_guests:
         noms = [g.get('invite_nom') for g in upcoming_guests if g.get('invite_nom')]
@@ -4481,15 +4559,20 @@ async def get_member_brief(current_user: dict = Depends(get_current_user)):
         guests_status_text = f"Nous n'avons pas d'invités prochainement pour le mois de {current_month_name}."
 
     # Détail structuré des invités du mois (pas seulement le compte) pour le
-    # widget Dashboard : titre de l'événement, date, nom de l'invité.
+    # widget Dashboard : titre de l'événement, date(s), nom de l'invité.
     guests_detail = [
         {
             "titre": g.get('titre', ''),
             "date_evenement": g['date_evenement'],
+            "date_fin_evenement": g.get('date_fin_evenement'),
             "invite_nom": g.get('invite_nom') or None,
         }
         for g in sorted(
-            [a for a in actualites if a.get('invite') and a.get('date_evenement') and a['date_evenement'].startswith(month_prefix)],
+            [
+                a for a in actualites
+                if a.get('invite') and a.get('date_evenement')
+                and _dates_overlap(a['date_evenement'], a.get('date_fin_evenement') or a['date_evenement'], f"{month_prefix}-01", month_end_str)
+            ],
             key=lambda a: a['date_evenement']
         )
     ]
@@ -4536,11 +4619,25 @@ async def get_member_brief(current_user: dict = Depends(get_current_user)):
                 if scheduled:
                     calendar_service_dates.append({"date": date_str, "jour": day_type})
                     calendar_service_debug.append({"date": date_str, "jour": day_type, "role_key": matched_role_key, "matched_value": matched_value})
-    calendar_events = [
-        {"date": a['date_evenement'], "titre": a.get('titre', ''), "invite": bool(a.get('invite')), "type": "evenement"}
-        for a in actualites
-        if a.get('date_evenement') and a['date_evenement'].startswith(month_prefix)
-    ]
+    # Éclaté jour par jour comme les absences quand l'actualité couvre une
+    # période (date_fin_evenement renseigné), pour que chaque jour de la
+    # période affiche le point sur le calendrier — pas juste le premier jour.
+    calendar_events = []
+    for a in actualites:
+        start = a.get('date_evenement')
+        if not start:
+            continue
+        end = a.get('date_fin_evenement') or start
+        if not _dates_overlap(start, end, f"{month_prefix}-01", month_end_str):
+            continue
+        try:
+            d = datetime.strptime(max(start, f"{month_prefix}-01"), "%Y-%m-%d").date()
+            d_end = datetime.strptime(min(end, month_end_str), "%Y-%m-%d").date()
+        except ValueError:
+            continue
+        while d <= d_end:
+            calendar_events.append({"date": d.strftime("%Y-%m-%d"), "titre": a.get('titre', ''), "invite": bool(a.get('invite')), "type": "evenement"})
+            d += timedelta(days=1)
 
     # Mes absences déclarées qui tombent ce mois-ci — éclatées jour par jour
     # (une absence peut être une plage) pour marquer chaque jour concerné.
@@ -4617,7 +4714,7 @@ async def get_member_brief(current_user: dict = Depends(get_current_user)):
 
     return {
         "upcoming_shifts": upcoming_shifts,
-        "upcoming_events": [{"titre": e['titre'], "date_evenement": e['date_evenement']} for e in upcoming_events],
+        "upcoming_events": [{"titre": e['titre'], "date_evenement": e['date_evenement'], "date_fin_evenement": e.get('date_fin_evenement')} for e in upcoming_events],
         "formations_catalogue_count": formations_catalogue_count,
         "service_info_text": await get_service_info_text(),
         "service_status_text": service_status_text,
