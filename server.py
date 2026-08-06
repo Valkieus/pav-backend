@@ -164,9 +164,10 @@ class AbsenceCreate(BaseModel):
     raison: str
 
 class AbsenceRecurringCreate(BaseModel):
-    jour_semaine: int  # 0=Lundi ... 6=Dimanche (Python date.weekday())
-    date_debut: str    # YYYY-MM-DD - début de la période récurrente
-    date_fin: str       # YYYY-MM-DD - fin de la période récurrente (incluse)
+    jours: List[str]      # sous-ensemble de ["vendredi", "dimanche"] — les deux jours de service de l'app, pas un choix générique de 7 jours
+    frequence: str = "hebdomadaire"  # "hebdomadaire" (chaque semaine) | "premier_du_mois" (le premier jour choisi de chaque mois)
+    date_debut: str        # YYYY-MM-DD - début de la période récurrente
+    date_fin: str           # YYYY-MM-DD - fin de la période récurrente (incluse)
     raison: str
 
 class AbsenceResponse(BaseModel):
@@ -3563,20 +3564,31 @@ async def create_absence(data: AbsenceCreate, current_user: dict = Depends(get_c
     await _append_absence_to_planning_notes(current_user['full_name'], data.date_debut, data.date_fin, data.raison)
     return AbsenceResponse(**{k: v for k, v in absence.items() if k != "_id"})
 
-JOURS_SEMAINE_LABELS = ["lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche"]
+# Les seuls jours pertinents pour une absence "répétée" sont les deux jours
+# de service de l'app — pas un choix générique de 7 jours de la semaine.
+JOURS_SERVICE_PY_WEEKDAY = {"vendredi": 4, "dimanche": 6}  # Python date.weekday(): Lundi=0 ... Dimanche=6
 
 @api_router.post("/absences/recurring", response_model=List[AbsenceResponse])
 async def create_recurring_absence(data: AbsenceRecurringCreate, current_user: dict = Depends(get_current_user)):
-    """Déclare une absence "répétée" : chaque occurrence du jour de la
-    semaine choisi, entre date_debut et date_fin, est matérialisée comme sa
-    propre absence d'un seul jour, reliée aux autres par un recurrence_id
-    commun. Ça évite de toucher à la logique de chevauchement/plage de
-    dates existante ailleurs dans l'app — chaque occurrence est une absence
-    ordinaire comme une autre."""
+    """Déclare une absence "répétée" sur un ou deux jours de service
+    (vendredi et/ou dimanche — cocher les deux = "le weekend"), selon deux
+    fréquences possibles :
+      - "hebdomadaire" : chaque occurrence du/des jour(s) choisi(s) entre
+        date_debut et date_fin (ex: tous les dimanches de la période).
+      - "premier_du_mois" : uniquement la première occurrence du/des
+        jour(s) choisi(s) dans chaque mois couvert par la période (ex: le
+        premier vendredi de chaque mois).
+    Chaque occurrence trouvée est matérialisée comme sa propre absence d'un
+    seul jour, reliée aux autres par un recurrence_id commun — ça évite de
+    toucher à la logique de chevauchement/plage de dates existante ailleurs
+    dans l'app."""
     if data.date_fin < data.date_debut:
         raise HTTPException(status_code=400, detail="La date de fin doit être après la date de début")
-    if not (0 <= data.jour_semaine <= 6):
-        raise HTTPException(status_code=400, detail="Jour de la semaine invalide")
+    jours = [j for j in (data.jours or []) if j in JOURS_SERVICE_PY_WEEKDAY]
+    if not jours:
+        raise HTTPException(status_code=400, detail="Choisis au moins un jour (vendredi et/ou dimanche)")
+    if data.frequence not in ("hebdomadaire", "premier_du_mois"):
+        raise HTTPException(status_code=400, detail="Fréquence invalide")
     try:
         start = datetime.strptime(data.date_debut, "%Y-%m-%d").date()
         end = datetime.strptime(data.date_fin, "%Y-%m-%d").date()
@@ -3586,12 +3598,33 @@ async def create_recurring_absence(data: AbsenceRecurringCreate, current_user: d
         raise HTTPException(status_code=400, detail="La période récurrente ne peut pas dépasser 1 an")
 
     recurrence_id = str(uuid.uuid4())
-    label = f"Absence récurrente (tous les {JOURS_SEMAINE_LABELS[data.jour_semaine]})"
-    offset = (data.jour_semaine - start.weekday()) % 7
-    cur = start + timedelta(days=offset)
+    jours_label = " et ".join(j.capitalize() for j in jours) if len(jours) > 1 else jours[0].capitalize()
+    freq_label = "chaque semaine" if data.frequence == "hebdomadaire" else "le 1er du mois"
+    label = f"Absence répétée ({jours_label}, {freq_label})"
+
+    dates_set = set()
+    if data.frequence == "hebdomadaire":
+        for j in jours:
+            wd = JOURS_SERVICE_PY_WEEKDAY[j]
+            offset = (wd - start.weekday()) % 7
+            cur = start + timedelta(days=offset)
+            while cur <= end:
+                dates_set.add(cur)
+                cur += timedelta(days=7)
+    else:  # premier_du_mois
+        cur_month = start.replace(day=1)
+        while cur_month <= end:
+            for j in jours:
+                wd = JOURS_SERVICE_PY_WEEKDAY[j]
+                offset = (wd - cur_month.weekday()) % 7
+                first_match = cur_month + timedelta(days=offset)
+                if start <= first_match <= end:
+                    dates_set.add(first_match)
+            cur_month = (cur_month.replace(day=28) + timedelta(days=4)).replace(day=1)
+
     created = []
-    while cur <= end:
-        day_str = cur.strftime("%Y-%m-%d")
+    for d in sorted(dates_set):
+        day_str = d.strftime("%Y-%m-%d")
         created.append({
             "id": str(uuid.uuid4()),
             "user_id": current_user["id"],
@@ -3603,19 +3636,18 @@ async def create_recurring_absence(data: AbsenceRecurringCreate, current_user: d
             "recurrence_id": recurrence_id,
             "recurrence_label": label,
         })
-        cur += timedelta(days=7)
 
     if not created:
         raise HTTPException(status_code=400, detail="Aucune occurrence trouvée dans cette période")
 
     await db.absences.insert_many(created)
-    await log_action(current_user['id'], current_user['full_name'], "Déclaration absence récurrente",
+    await log_action(current_user['id'], current_user['full_name'], "Déclaration absence répétée",
                       f"{label}, {data.date_debut} → {data.date_fin} ({len(created)} occurrences): {data.raison}")
     gestion_ids = await get_user_ids_by_roles(["Super Admin", "Admin", "Responsable", "Gestionnaire"])
     await create_notification(
         gestion_ids, "absence",
-        "Nouvelle absence récurrente déclarée",
-        f"{current_user['full_name']} sera {label.lower()} du {data.date_debut} au {data.date_fin} ({len(created)} dates, {data.raison}).",
+        "Nouvelle absence répétée déclarée",
+        f"{current_user['full_name']} sera absent(e) — {label.lower()} — du {data.date_debut} au {data.date_fin} ({len(created)} dates, {data.raison}).",
         link="/planning"
     )
     for a in created:
@@ -4033,38 +4065,57 @@ async def update_service_info_text(data: ServiceInfoUpdate, current_user: dict =
     await log_action(current_user['id'], current_user['full_name'], "Modification rappel horaires", text)
     return {"status": "success", "service_info_text": text}
 
-# Signalement de retard : les personnes toujours notifiées en plus du/de la
-# superviseur du jour trouvé sur le planning — le Responsable PAV et les
-# Responsables Coordination, comme demandé. Correspondance par nom (même
+# Signalement de retard : personnes TOUJOURS notifiées en plus du/de la
+# superviseur du jour trouvé sur le planning — utilisé uniquement comme
+# valeur par défaut tant qu'un Admin n'a pas configuré la liste depuis
+# Administration (notify_user_ids ci-dessous). Correspondance par nom (même
 # schéma que le reste de l'app, cf. validation badge).
 RETARD_ALWAYS_NOTIFY_NAMES = ["Paul Baptista", "Delphine", "Winchel"]
 
+# "Gestionnaire+" — rôles éligibles pour recevoir les notifications de
+# retard, dans l'ordre de NIVEAUX_ACCES.
+GESTIONNAIRE_PLUS_ROLES = ["Gestionnaire", "Admin (lecture seule)", "Admin", "Super Admin"]
+
 async def get_retard_settings() -> dict:
-    """Activation du signalement de retard — off par défaut, activable
-    uniquement par un Admin/Super Admin depuis Administration."""
+    """Activation du signalement de retard (off par défaut, activable
+    uniquement par un Admin/Super Admin) + liste des destinataires
+    Gestionnaire+ toujours notifiés en plus du superviseur du jour —
+    configurables depuis Administration."""
     doc = await db.settings.find_one({"_key": "retard_notification"})
     if not doc:
         await db.settings.update_one(
             {"_key": "retard_notification"},
-            {"$set": {"_key": "retard_notification", "enabled": False}},
+            {"$set": {"_key": "retard_notification", "enabled": False, "notify_user_ids": []}},
             upsert=True
         )
-        return {"enabled": False}
-    return {"enabled": bool(doc.get("enabled", False))}
+        return {"enabled": False, "notify_user_ids": []}
+    return {"enabled": bool(doc.get("enabled", False)), "notify_user_ids": doc.get("notify_user_ids") or []}
 
 @api_router.get("/dashboard/retard-settings")
 async def get_retard_settings_route(current_user: dict = Depends(get_current_user)):
     return await get_retard_settings()
 
 class RetardSettingsUpdate(BaseModel):
-    enabled: bool
+    enabled: Optional[bool] = None
+    notify_user_ids: Optional[List[str]] = None
 
 @api_router.put("/dashboard/retard-settings")
 async def update_retard_settings(data: RetardSettingsUpdate, current_user: dict = Depends(get_current_user)):
     check_access(current_user, ["Super Admin", "Admin"])
-    await db.settings.update_one({"_key": "retard_notification"}, {"$set": {"enabled": data.enabled}}, upsert=True)
-    await log_action(current_user['id'], current_user['full_name'], "Modification signalement de retard", f"Activé: {data.enabled}")
-    return {"enabled": data.enabled}
+    update = {}
+    if data.enabled is not None:
+        update["enabled"] = data.enabled
+    if data.notify_user_ids is not None:
+        # Restreint la liste aux comptes Gestionnaire+ uniquement.
+        valid_ids = set()
+        async for u in db.users.find({"niveau_acces": {"$in": GESTIONNAIRE_PLUS_ROLES}}, {"_id": 0, "id": 1}):
+            valid_ids.add(u["id"])
+        update["notify_user_ids"] = [uid for uid in data.notify_user_ids if uid in valid_ids]
+    if not update:
+        raise HTTPException(status_code=400, detail="Rien à mettre à jour")
+    await db.settings.update_one({"_key": "retard_notification"}, {"$set": update}, upsert=True)
+    await log_action(current_user['id'], current_user['full_name'], "Modification signalement de retard", str(update))
+    return await get_retard_settings()
 
 class RetardCreate(BaseModel):
     date: str            # YYYY-MM-DD — doit être le jour de service en cours
@@ -4153,16 +4204,28 @@ async def signal_retard(data: RetardCreate, current_user: dict = Depends(get_cur
                         if v_idx == date_idx and value:
                             supervisor_names.add(value.strip())
 
-    all_target_names = supervisor_names | set(RETARD_ALWAYS_NOTIFY_NAMES)
     recipient_ids = set()
-    if all_target_names:
-        lowered_targets = {n.strip().lower() for n in all_target_names}
+    if supervisor_names:
+        lowered_targets = {n.strip().lower() for n in supervisor_names}
         async for u in db.users.find({}, {"_id": 0, "id": 1, "full_name": 1}):
             uname = (u.get("full_name") or "").strip().lower()
             if uname and uname in lowered_targets:
                 recipient_ids.add(u["id"])
+
+    configured_ids = settings.get("notify_user_ids") or []
+    if configured_ids:
+        # Liste Gestionnaire+ configurée depuis Administration.
+        recipient_ids.update(configured_ids)
+    else:
+        # Pas encore configuré -> valeur par défaut historique (Paul/Delphine/Winchel).
+        lowered_defaults = {n.strip().lower() for n in RETARD_ALWAYS_NOTIFY_NAMES}
+        async for u in db.users.find({}, {"_id": 0, "id": 1, "full_name": 1}):
+            uname = (u.get("full_name") or "").strip().lower()
+            if uname and uname in lowered_defaults:
+                recipient_ids.add(u["id"])
+
     if not recipient_ids:
-        # Filet de sécurité : personne résolu par nom -> prévenir Admin/Super Admin
+        # Filet de sécurité : personne résolu -> prévenir Admin/Super Admin
         recipient_ids = set(await get_user_ids_by_roles(["Super Admin", "Admin"]))
 
     date_label = d.strftime("%d/%m/%Y")
@@ -4293,6 +4356,14 @@ async def get_member_brief(current_user: dict = Depends(get_current_user)):
     # Actualités marqués "invité" dont la date tombe ce mois-ci, pas encore
     # passée.
     month_prefix = f"{now.year:04d}-{now.month:02d}"
+    _month_last_day = 31
+    while True:
+        try:
+            datetime.strptime(f"{month_prefix}-{_month_last_day:02d}", "%Y-%m-%d")
+            break
+        except ValueError:
+            _month_last_day -= 1
+    month_end_str = f"{month_prefix}-{_month_last_day:02d}"
     upcoming_guests = [
         a for a in actualites
         if a.get('invite') and a.get('date_evenement')
@@ -4347,11 +4418,11 @@ async def get_member_brief(current_user: dict = Depends(get_current_user)):
     ).to_list(500)
     calendar_personal = []
     for a in my_absences_this_month:
-        if not _dates_overlap(a["date_debut"], a["date_fin"], f"{month_prefix}-01", f"{month_prefix}-31"):
+        if not _dates_overlap(a["date_debut"], a["date_fin"], f"{month_prefix}-01", month_end_str):
             continue
         try:
             d = datetime.strptime(max(a["date_debut"], f"{month_prefix}-01"), "%Y-%m-%d").date()
-            d_end = datetime.strptime(min(a["date_fin"], f"{month_prefix}-31"), "%Y-%m-%d").date()
+            d_end = datetime.strptime(min(a["date_fin"], month_end_str), "%Y-%m-%d").date()
         except ValueError:
             continue
         while d <= d_end:
