@@ -4587,6 +4587,23 @@ async def get_member_brief(current_user: dict = Depends(get_current_user)):
     # est personnellement planifiée, pas tous les vendredis/dimanches où
     # l'église a un service (sinon la légende du calendrier ne veut plus rien
     # dire — même correspondance nom/affectation que upcoming_shifts).
+    def _role_label_for_key(sections_map_arg, day_type_arg, full_key):
+        """Retrouve le libellé humain d'un poste ("Opérateur VDO B") à
+        partir de sa clé d'affectation brute ("operateur_vdo_b_0") — pour
+        l'aperçu rapide au clic sur un jour de service du calendrier."""
+        if not full_key:
+            return None
+        day_sections = sections_map_arg.get(day_type_arg) or {}
+        for table_key in ('table1', 'table2'):
+            for section in (day_sections.get(table_key) or []):
+                for role in (section.get('roles') or []):
+                    rk = role.get('key')
+                    if not rk:
+                        continue
+                    if full_key == rk or full_key.startswith(f"{rk}_"):
+                        return role.get('label') or rk
+        return full_key
+
     calendar_service_dates = []
     # Trace de debug (Super Admin uniquement, cf. return) : pour chaque date
     # marquée "de service", quelle clé/valeur de cellule a déclenché le
@@ -4596,6 +4613,7 @@ async def get_member_brief(current_user: dict = Depends(get_current_user)):
     if current_planning:
         day_dates_map = current_planning.get('dates') or {}
         affectations_map = current_planning.get('affectations') or {}
+        sections_map_cal = current_planning.get('sections') or {}
         for day_type in ['vendredi', 'dimanche']:
             day_dates = day_dates_map.get(day_type) or []
             for idx, date_str in enumerate(day_dates):
@@ -4617,7 +4635,8 @@ async def get_member_brief(current_user: dict = Depends(get_current_user)):
                     if scheduled:
                         break
                 if scheduled:
-                    calendar_service_dates.append({"date": date_str, "jour": day_type})
+                    poste_label = _role_label_for_key(sections_map_cal, day_type, matched_role_key)
+                    calendar_service_dates.append({"date": date_str, "jour": day_type, "poste": poste_label})
                     calendar_service_debug.append({"date": date_str, "jour": day_type, "role_key": matched_role_key, "matched_value": matched_value})
     # Éclaté jour par jour comme les absences quand l'actualité couvre une
     # période (date_fin_evenement renseigné), pour que chaque jour de la
