@@ -4065,6 +4065,34 @@ async def update_service_info_text(data: ServiceInfoUpdate, current_user: dict =
     await log_action(current_user['id'], current_user['full_name'], "Modification rappel horaires", text)
     return {"status": "success", "service_info_text": text}
 
+# Correspondance nom compte <-> valeur de cellule planning, utilisée pour
+# déduire "je suis planifié ce jour-là" à plusieurs endroits (calendrier
+# Dashboard, upcoming_shifts, bouton retard). L'ancienne version acceptait
+# une simple sous-chaîne dans un sens OU l'autre ("v in target_name or
+# target_name in v"), ce qui donnait de faux positifs dès qu'une cellule
+# contenait un fragment court (ex : une initiale, un nom de rôle) qui se
+# trouvait être une sous-chaîne du nom complet de quelqu'un — d'où des
+# personnes marquées "de service" des jours où elles ne le sont pas. On
+# exige maintenant soit une égalité stricte, soit que l'un des deux noms
+# (découpé en mots) soit ENTIÈREMENT inclus dans l'autre, mot par mot, avec
+# une longueur minimale pour éviter les collisions sur des mots trop courts.
+def _name_matches_strict(target_name: str, value) -> bool:
+    if not target_name or not value or not isinstance(value, str):
+        return False
+    v = value.strip().lower()
+    if not v:
+        return False
+    if v == target_name:
+        return True
+    if len(v) < 4 or len(target_name) < 4:
+        return False
+    v_tokens = set(t for t in v.split() if len(t) >= 2)
+    target_tokens = set(t for t in target_name.split() if len(t) >= 2)
+    if not v_tokens or not target_tokens:
+        return False
+    shorter, longer = (v_tokens, target_tokens) if len(v) <= len(target_name) else (target_tokens, v_tokens)
+    return shorter.issubset(longer)
+
 # Signalement de retard : personnes TOUJOURS notifiées en plus du/de la
 # superviseur du jour trouvé sur le planning — utilisé uniquement comme
 # valeur par défaut tant qu'un Admin n'a pas configuré la liste depuis
@@ -4203,10 +4231,7 @@ async def signal_retard(data: RetardCreate, current_user: dict = Depends(get_cur
     target_name = (current_user.get('full_name') or '').strip().lower()
 
     def _name_matches_local(value) -> bool:
-        if not target_name or not value or not isinstance(value, str):
-            return False
-        v = value.strip().lower()
-        return bool(v) and (v == target_name or v in target_name or target_name in v)
+        return _name_matches_strict(target_name, value)
 
     planning = planning or {}
     day_dates_map = planning.get('dates') or {}
@@ -4315,12 +4340,7 @@ async def get_member_brief(current_user: dict = Depends(get_current_user)):
     target_name = (current_user.get('full_name') or '').strip().lower()
 
     def _name_matches(value) -> bool:
-        if not target_name or not value or not isinstance(value, str):
-            return False
-        v = value.strip().lower()
-        if not v:
-            return False
-        return v == target_name or v in target_name or target_name in v
+        return _name_matches_strict(target_name, value)
 
     months_to_check = [(now.year, now.month)]
     next_month, next_year = now.month + 1, now.year
