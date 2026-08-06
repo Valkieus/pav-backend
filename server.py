@@ -4117,6 +4117,61 @@ async def update_retard_settings(data: RetardSettingsUpdate, current_user: dict 
     await log_action(current_user['id'], current_user['full_name'], "Modification signalement de retard", str(update))
     return await get_retard_settings()
 
+# ==================== MODE TEST (Administration > Maintenance) ====================
+# Permet à un Admin/Super Admin de désigner des comptes existants comme
+# "testeurs" pour valider les fonctionnalités qui dépendent normalement du
+# jour réel (ex : bouton "Signaler un retard", visible uniquement le jour où
+# la personne est planifiée). Une fois un utilisateur ajouté à la liste et le
+# mode test activé, les vérifications de "planifié aujourd'hui" sont
+# contournées UNIQUEMENT pour ce compte — tout le reste du comportement
+# (notifications réellement envoyées, logs, etc.) fonctionne normalement,
+# donc c'est un vrai test de bout en bout, pas une simulation. L'Admin garde
+# la main pour retirer un testeur (ou couper le mode test entier) à tout
+# moment depuis Administration > Maintenance.
+async def get_test_mode_settings() -> dict:
+    doc = await db.settings.find_one({"_key": "test_mode"})
+    if not doc:
+        await db.settings.update_one(
+            {"_key": "test_mode"},
+            {"$set": {"_key": "test_mode", "enabled": False, "test_user_ids": []}},
+            upsert=True
+        )
+        return {"enabled": False, "test_user_ids": []}
+    return {"enabled": bool(doc.get("enabled", False)), "test_user_ids": doc.get("test_user_ids") or []}
+
+async def _is_test_user(current_user: dict) -> bool:
+    settings = await get_test_mode_settings()
+    if not settings.get("enabled"):
+        return False
+    return current_user["id"] in (settings.get("test_user_ids") or [])
+
+@api_router.get("/admin/test-mode")
+async def get_test_mode_route(current_user: dict = Depends(get_current_user)):
+    check_access(current_user, ["Super Admin", "Admin"])
+    return await get_test_mode_settings()
+
+class TestModeUpdate(BaseModel):
+    enabled: Optional[bool] = None
+    test_user_ids: Optional[List[str]] = None
+
+@api_router.put("/admin/test-mode")
+async def update_test_mode(data: TestModeUpdate, current_user: dict = Depends(get_current_user)):
+    check_access(current_user, ["Super Admin", "Admin"])
+    update = {}
+    if data.enabled is not None:
+        update["enabled"] = data.enabled
+    if data.test_user_ids is not None:
+        valid_ids = set()
+        async for u in db.users.find({}, {"_id": 0, "id": 1}):
+            valid_ids.add(u["id"])
+        update["test_user_ids"] = [uid for uid in data.test_user_ids if uid in valid_ids]
+    if not update:
+        raise HTTPException(status_code=400, detail="Rien à mettre à jour")
+    await db.settings.update_one({"_key": "test_mode"}, {"$set": update}, upsert=True)
+    label = f"enabled={update['enabled']}" if "enabled" in update else f"{len(update.get('test_user_ids', []))} testeur(s)"
+    await log_action(current_user['id'], current_user['full_name'], "Modification mode test", label)
+    return await get_test_mode_settings()
+
 class RetardCreate(BaseModel):
     date: str            # YYYY-MM-DD — doit être le jour de service en cours
     heure_estimee: str   # texte libre, ex "18h45" ou "~19h"
@@ -4139,8 +4194,10 @@ async def signal_retard(data: RetardCreate, current_user: dict = Depends(get_cur
     except ValueError:
         raise HTTPException(status_code=400, detail="Date invalide")
 
+    is_test_user = await _is_test_user(current_user)
+
     planning = await db.planning.find_one({"annee": d.year, "mois": d.month, "is_archived": False}, {"_id": 0})
-    if not planning:
+    if not planning and not is_test_user:
         raise HTTPException(status_code=404, detail="Aucun planning trouvé pour cette date")
 
     target_name = (current_user.get('full_name') or '').strip().lower()
@@ -4151,6 +4208,7 @@ async def signal_retard(data: RetardCreate, current_user: dict = Depends(get_cur
         v = value.strip().lower()
         return bool(v) and (v == target_name or v in target_name or target_name in v)
 
+    planning = planning or {}
     day_dates_map = planning.get('dates') or {}
     affectations_map = planning.get('affectations') or {}
     sections_map = planning.get('sections') or {}
@@ -4177,8 +4235,14 @@ async def signal_retard(data: RetardCreate, current_user: dict = Depends(get_cur
                 break
         break
 
-    if not is_scheduled:
+    if not is_scheduled and not is_test_user:
         raise HTTPException(status_code=403, detail="Vous n'êtes pas planifié(e) ce jour-là")
+
+    if not is_scheduled and is_test_user:
+        # Testeur désigné en Administration > Maintenance : on ignore la
+        # correspondance planning/nom pour permettre le test, mais on garde
+        # un jour de service plausible pour le message envoyé.
+        day_type_found = day_type_found or 'vendredi'
 
     # Superviseur du jour : n'importe quel rôle dont le libellé contient
     # "superviseur", affecté sur cette date précise.
@@ -4229,12 +4293,14 @@ async def signal_retard(data: RetardCreate, current_user: dict = Depends(get_cur
         recipient_ids = set(await get_user_ids_by_roles(["Super Admin", "Admin"]))
 
     date_label = d.strftime("%d/%m/%Y")
-    msg = f"{current_user['full_name']} sera en retard le {date_label} ({day_type_found}), arrivée estimée vers {data.heure_estimee}."
+    test_prefix = "[TEST] " if is_test_user else ""
+    msg = f"{test_prefix}{current_user['full_name']} sera en retard le {date_label} ({day_type_found}), arrivée estimée vers {data.heure_estimee}."
     if data.message:
         msg += f" {data.message}"
+    title = "[TEST] Signalement de retard" if is_test_user else "Signalement de retard"
 
-    await create_notification(list(recipient_ids), "retard", "Signalement de retard", msg, link="/planning")
-    await log_action(current_user['id'], current_user['full_name'], "Signalement de retard", f"{data.date} — {data.heure_estimee}")
+    await create_notification(list(recipient_ids), "retard", title, msg, link="/planning")
+    await log_action(current_user['id'], current_user['full_name'], "Signalement de retard" + (" (test)" if is_test_user else ""), f"{data.date} — {data.heure_estimee}")
     return {"message": "Signalement envoyé", "notified": len(recipient_ids)}
 
 @api_router.get("/dashboard/member-brief")
@@ -4477,6 +4543,15 @@ async def get_member_brief(current_user: dict = Depends(get_current_user)):
                     break
             break
 
+    # Mode test (Administration > Maintenance) : pour les comptes désignés
+    # comme testeurs, on force "planifié aujourd'hui" même un jour hors
+    # planning, pour pouvoir tester le bouton "Signaler un retard" sans
+    # attendre un vrai vendredi/dimanche de service.
+    test_mode_active = await _is_test_user(current_user)
+    if test_mode_active and retard_settings.get("enabled") and not is_scheduled_today:
+        is_scheduled_today = True
+        today_service_type = today_service_type or "test"
+
     return {
         "upcoming_shifts": upcoming_shifts,
         "upcoming_events": [{"titre": e['titre'], "date_evenement": e['date_evenement']} for e in upcoming_events],
@@ -4492,6 +4567,7 @@ async def get_member_brief(current_user: dict = Depends(get_current_user)):
         "retard_is_scheduled_today": is_scheduled_today,
         "retard_today_service_type": today_service_type,
         "retard_today_date": today_str,
+        "test_mode_active": test_mode_active,
     }
 
 # ==================== ORGANIGRAMME ====================
