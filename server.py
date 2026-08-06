@@ -163,6 +163,12 @@ class AbsenceCreate(BaseModel):
     date_fin: str    # YYYY-MM-DD
     raison: str
 
+class AbsenceRecurringCreate(BaseModel):
+    jour_semaine: int  # 0=Lundi ... 6=Dimanche (Python date.weekday())
+    date_debut: str    # YYYY-MM-DD - début de la période récurrente
+    date_fin: str       # YYYY-MM-DD - fin de la période récurrente (incluse)
+    raison: str
+
 class AbsenceResponse(BaseModel):
     id: str
     user_id: str
@@ -171,6 +177,8 @@ class AbsenceResponse(BaseModel):
     date_fin: str
     raison: str
     created_at: str
+    recurrence_id: Optional[str] = None
+    recurrence_label: Optional[str] = None
 
 class TokenResponse(BaseModel):
     access_token: str
@@ -1879,7 +1887,22 @@ async def get_unclaimed_techniciens():
     claimed_ids = set()
     async for u in db.users.find({"technicien_id": {"$ne": None}}, {"_id": 0, "technicien_id": 1}):
         claimed_ids.add(u.get("technicien_id"))
-    return [t for t in techniciens if t["id"] not in claimed_ids]
+    # La plupart des comptes créés directement par un Admin (hors
+    # auto-inscription) ne sont jamais reliés via technicien_id — même clé
+    # de correspondance par nom (insensible à la casse) qu'ailleurs dans
+    # l'app (ex: validation badge), pour ne pas laisser apparaître dans la
+    # liste d'inscription des techniciens qui ont déjà un compte créé côté
+    # admin.
+    claimed_names = set()
+    async for u in db.users.find({}, {"_id": 0, "full_name": 1}):
+        name = (u.get("full_name") or "").strip().lower()
+        if name:
+            claimed_names.add(name)
+    return [
+        t for t in techniciens
+        if t["id"] not in claimed_ids
+        and (t.get("nom") or "").strip().lower() not in claimed_names
+    ]
 
 @api_router.post("/auth/register", response_model=TokenResponse)
 async def register(data: RegisterRequest):
@@ -3540,6 +3563,78 @@ async def create_absence(data: AbsenceCreate, current_user: dict = Depends(get_c
     await _append_absence_to_planning_notes(current_user['full_name'], data.date_debut, data.date_fin, data.raison)
     return AbsenceResponse(**{k: v for k, v in absence.items() if k != "_id"})
 
+JOURS_SEMAINE_LABELS = ["lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche"]
+
+@api_router.post("/absences/recurring", response_model=List[AbsenceResponse])
+async def create_recurring_absence(data: AbsenceRecurringCreate, current_user: dict = Depends(get_current_user)):
+    """Déclare une absence "répétée" : chaque occurrence du jour de la
+    semaine choisi, entre date_debut et date_fin, est matérialisée comme sa
+    propre absence d'un seul jour, reliée aux autres par un recurrence_id
+    commun. Ça évite de toucher à la logique de chevauchement/plage de
+    dates existante ailleurs dans l'app — chaque occurrence est une absence
+    ordinaire comme une autre."""
+    if data.date_fin < data.date_debut:
+        raise HTTPException(status_code=400, detail="La date de fin doit être après la date de début")
+    if not (0 <= data.jour_semaine <= 6):
+        raise HTTPException(status_code=400, detail="Jour de la semaine invalide")
+    try:
+        start = datetime.strptime(data.date_debut, "%Y-%m-%d").date()
+        end = datetime.strptime(data.date_fin, "%Y-%m-%d").date()
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Format de date invalide")
+    if (end - start).days > 366:
+        raise HTTPException(status_code=400, detail="La période récurrente ne peut pas dépasser 1 an")
+
+    recurrence_id = str(uuid.uuid4())
+    label = f"Absence récurrente (tous les {JOURS_SEMAINE_LABELS[data.jour_semaine]})"
+    offset = (data.jour_semaine - start.weekday()) % 7
+    cur = start + timedelta(days=offset)
+    created = []
+    while cur <= end:
+        day_str = cur.strftime("%Y-%m-%d")
+        created.append({
+            "id": str(uuid.uuid4()),
+            "user_id": current_user["id"],
+            "full_name": current_user["full_name"],
+            "date_debut": day_str,
+            "date_fin": day_str,
+            "raison": data.raison,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "recurrence_id": recurrence_id,
+            "recurrence_label": label,
+        })
+        cur += timedelta(days=7)
+
+    if not created:
+        raise HTTPException(status_code=400, detail="Aucune occurrence trouvée dans cette période")
+
+    await db.absences.insert_many(created)
+    await log_action(current_user['id'], current_user['full_name'], "Déclaration absence récurrente",
+                      f"{label}, {data.date_debut} → {data.date_fin} ({len(created)} occurrences): {data.raison}")
+    gestion_ids = await get_user_ids_by_roles(["Super Admin", "Admin", "Responsable", "Gestionnaire"])
+    await create_notification(
+        gestion_ids, "absence",
+        "Nouvelle absence récurrente déclarée",
+        f"{current_user['full_name']} sera {label.lower()} du {data.date_debut} au {data.date_fin} ({len(created)} dates, {data.raison}).",
+        link="/planning"
+    )
+    for a in created:
+        await _append_absence_to_planning_notes(current_user['full_name'], a["date_debut"], a["date_fin"], a["raison"])
+    return [AbsenceResponse(**{k: v for k, v in a.items() if k != "_id"}) for a in created]
+
+@api_router.delete("/absences/recurring/{recurrence_id}")
+async def delete_recurring_absence(recurrence_id: str, current_user: dict = Depends(get_current_user)):
+    sample = await db.absences.find_one({"recurrence_id": recurrence_id}, {"_id": 0})
+    if not sample:
+        raise HTTPException(status_code=404, detail="Série d'absences non trouvée")
+    is_owner = sample["user_id"] == current_user["id"]
+    is_manager = current_user["niveau_acces"] in ["Super Admin", "Admin", "Responsable", "Gestionnaire"]
+    if not is_owner and not is_manager:
+        raise HTTPException(status_code=403, detail="Accès refusé")
+    result = await db.absences.delete_many({"recurrence_id": recurrence_id})
+    await log_action(current_user['id'], current_user['full_name'], "Suppression absence récurrente", f"{recurrence_id} ({result.deleted_count} dates)")
+    return {"message": f"{result.deleted_count} absence(s) supprimée(s)"}
+
 @api_router.get("/absences/mine", response_model=List[AbsenceResponse])
 async def get_my_absences(current_user: dict = Depends(get_current_user)):
     await _purge_expired_absences()
@@ -3589,6 +3684,104 @@ async def delete_absence(absence_id: str, current_user: dict = Depends(get_curre
     await db.absences.delete_one({"id": absence_id})
     await log_action(current_user['id'], current_user['full_name'], "Suppression absence", absence_id)
     return {"message": "Absence supprimée"}
+
+@api_router.get("/planning/kpi-presence")
+async def get_planning_kpi_presence(mois: Optional[int] = None, annee: Optional[int] = None, current_user: dict = Depends(get_current_user)):
+    """Rapport KPI présence/absences : pour chaque personne planifiée dans le
+    mois demandé, compare le nombre de fois où elle est affectée sur le
+    planning au nombre d'absences qu'elle a déclarées sur la même période, et
+    signale les dates où elle est planifiée alors qu'une absence est
+    déclarée ce jour-là (incohérence planning/absence). L'app ne trackant
+    pas la présence réelle, ce tableau sert de base d'analyse manuelle pour
+    repérer les personnes planifiées mais jamais notées absentes (ou
+    l'inverse) — pas un jugement automatique."""
+    check_access(current_user, ["Super Admin", "Admin", "Admin (lecture seule)", "Responsable", "Gestionnaire"])
+    now = datetime.now(timezone.utc)
+    mois = mois or now.month
+    annee = annee or now.year
+
+    planning = await db.planning.find_one({"annee": annee, "mois": mois, "is_archived": False}, {"_id": 0})
+    month_prefix = f"{annee:04d}-{mois:02d}"
+
+    # 1) Qui est planifié, quels jours (par nom — comme le reste du module,
+    # l'affectation planning est un texte libre, pas un id de compte).
+    scheduled_by_name = {}  # name -> set of date strings
+    if planning:
+        day_dates_map = planning.get('dates') or {}
+        affectations_map = planning.get('affectations') or {}
+        for day_type in ['vendredi', 'dimanche']:
+            day_dates = day_dates_map.get(day_type) or []
+            if not day_dates:
+                continue
+            for values in affectations_map.values():
+                if not values:
+                    continue
+                items = enumerate(values) if isinstance(values, list) else values.items()
+                for idx_key, value in items:
+                    try:
+                        idx = int(idx_key)
+                    except (TypeError, ValueError):
+                        continue
+                    if idx < 0 or idx >= len(day_dates):
+                        continue
+                    name = (value or "").strip()
+                    if not name:
+                        continue
+                    scheduled_by_name.setdefault(name, set()).add(day_dates[idx])
+
+    # 2) Quelles absences déclarées couvrent ce mois, éclatées jour par jour
+    # (les absences peuvent être des plages ; on ne garde que les jours du
+    # mois demandé) — indexées par nom déclarant.
+    last_day = 31
+    while True:
+        try:
+            datetime.strptime(f"{annee:04d}-{mois:02d}-{last_day:02d}", "%Y-%m-%d")
+            break
+        except ValueError:
+            last_day -= 1
+    month_start, month_end = f"{month_prefix}-01", f"{month_prefix}-{last_day:02d}"
+    all_absences = await db.absences.find({}, {"_id": 0}).to_list(5000)
+    absence_days_by_name = {}  # name -> set of date strings within this month
+    absence_count_by_name = {}  # name -> number of declared absence records overlapping this month
+    for a in all_absences:
+        if not _dates_overlap(a["date_debut"], a["date_fin"], month_start, month_end):
+            continue
+        name = (a.get("full_name") or "").strip()
+        if not name:
+            continue
+        absence_count_by_name[name] = absence_count_by_name.get(name, 0) + 1
+        try:
+            d = datetime.strptime(max(a["date_debut"], month_start), "%Y-%m-%d").date()
+            d_end = datetime.strptime(min(a["date_fin"], month_end), "%Y-%m-%d").date()
+        except ValueError:
+            continue
+        days = absence_days_by_name.setdefault(name, set())
+        while d <= d_end:
+            days.add(d.strftime("%Y-%m-%d"))
+            d += timedelta(days=1)
+
+    all_names = sorted(set(scheduled_by_name.keys()) | set(absence_days_by_name.keys()))
+    rows = []
+    for name in all_names:
+        sched_dates = sorted(scheduled_by_name.get(name, set()))
+        absence_days = absence_days_by_name.get(name, set())
+        overlap_dates = sorted(set(sched_dates) & absence_days)
+        rows.append({
+            "full_name": name,
+            "times_scheduled": len(sched_dates),
+            "dates_scheduled": sched_dates,
+            "absences_declared": absence_count_by_name.get(name, 0),
+            "overlap_count": len(overlap_dates),
+            "dates_overlap": overlap_dates,
+        })
+    rows.sort(key=lambda r: (-r["times_scheduled"], r["full_name"]))
+
+    return {
+        "mois": mois,
+        "annee": annee,
+        "generated_at": now.isoformat(),
+        "rows": rows,
+    }
 
 # ==================== ACTUALITES ROUTES ====================
 
@@ -3840,6 +4033,147 @@ async def update_service_info_text(data: ServiceInfoUpdate, current_user: dict =
     await log_action(current_user['id'], current_user['full_name'], "Modification rappel horaires", text)
     return {"status": "success", "service_info_text": text}
 
+# Signalement de retard : les personnes toujours notifiées en plus du/de la
+# superviseur du jour trouvé sur le planning — le Responsable PAV et les
+# Responsables Coordination, comme demandé. Correspondance par nom (même
+# schéma que le reste de l'app, cf. validation badge).
+RETARD_ALWAYS_NOTIFY_NAMES = ["Paul Baptista", "Delphine", "Winchel"]
+
+async def get_retard_settings() -> dict:
+    """Activation du signalement de retard — off par défaut, activable
+    uniquement par un Admin/Super Admin depuis Administration."""
+    doc = await db.settings.find_one({"_key": "retard_notification"})
+    if not doc:
+        await db.settings.update_one(
+            {"_key": "retard_notification"},
+            {"$set": {"_key": "retard_notification", "enabled": False}},
+            upsert=True
+        )
+        return {"enabled": False}
+    return {"enabled": bool(doc.get("enabled", False))}
+
+@api_router.get("/dashboard/retard-settings")
+async def get_retard_settings_route(current_user: dict = Depends(get_current_user)):
+    return await get_retard_settings()
+
+class RetardSettingsUpdate(BaseModel):
+    enabled: bool
+
+@api_router.put("/dashboard/retard-settings")
+async def update_retard_settings(data: RetardSettingsUpdate, current_user: dict = Depends(get_current_user)):
+    check_access(current_user, ["Super Admin", "Admin"])
+    await db.settings.update_one({"_key": "retard_notification"}, {"$set": {"enabled": data.enabled}}, upsert=True)
+    await log_action(current_user['id'], current_user['full_name'], "Modification signalement de retard", f"Activé: {data.enabled}")
+    return {"enabled": data.enabled}
+
+class RetardCreate(BaseModel):
+    date: str            # YYYY-MM-DD — doit être le jour de service en cours
+    heure_estimee: str   # texte libre, ex "18h45" ou "~19h"
+    message: Optional[str] = None
+
+@api_router.post("/planning/retard")
+async def signal_retard(data: RetardCreate, current_user: dict = Depends(get_current_user)):
+    """Signale un retard pour le service du jour indiqué. Vérifie côté
+    serveur — pas seulement côté UI — que le signalement est activé ET que
+    l'utilisateur est bien planifié ce jour-là (basé sur le planning
+    publié), puis notifie le/la superviseur du jour (rôle dont le libellé
+    contient "superviseur" sur le planning de ce jour) ainsi que le
+    Responsable PAV et les Responsables Coordination."""
+    settings = await get_retard_settings()
+    if not settings.get("enabled"):
+        raise HTTPException(status_code=403, detail="Le signalement de retard n'est pas activé")
+
+    try:
+        d = datetime.strptime(data.date, "%Y-%m-%d").date()
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Date invalide")
+
+    planning = await db.planning.find_one({"annee": d.year, "mois": d.month, "is_archived": False}, {"_id": 0})
+    if not planning:
+        raise HTTPException(status_code=404, detail="Aucun planning trouvé pour cette date")
+
+    target_name = (current_user.get('full_name') or '').strip().lower()
+
+    def _name_matches_local(value) -> bool:
+        if not target_name or not value or not isinstance(value, str):
+            return False
+        v = value.strip().lower()
+        return bool(v) and (v == target_name or v in target_name or target_name in v)
+
+    day_dates_map = planning.get('dates') or {}
+    affectations_map = planning.get('affectations') or {}
+    sections_map = planning.get('sections') or {}
+
+    is_scheduled, day_type_found, date_idx = False, None, None
+    for day_type in ['vendredi', 'dimanche']:
+        day_dates = day_dates_map.get(day_type) or []
+        if data.date not in day_dates:
+            continue
+        idx = day_dates.index(data.date)
+        for values in affectations_map.values():
+            if not values:
+                continue
+            items = enumerate(values) if isinstance(values, list) else values.items()
+            for idx_key, value in items:
+                try:
+                    v_idx = int(idx_key)
+                except (TypeError, ValueError):
+                    continue
+                if v_idx == idx and _name_matches_local(value):
+                    is_scheduled, day_type_found, date_idx = True, day_type, idx
+                    break
+            if is_scheduled:
+                break
+        break
+
+    if not is_scheduled:
+        raise HTTPException(status_code=403, detail="Vous n'êtes pas planifié(e) ce jour-là")
+
+    # Superviseur du jour : n'importe quel rôle dont le libellé contient
+    # "superviseur", affecté sur cette date précise.
+    supervisor_names = set()
+    day_sections = sections_map.get(day_type_found) or {}
+    for table_key in ('table1', 'table2'):
+        for section in (day_sections.get(table_key) or []):
+            for role in (section.get('roles') or []):
+                label = role.get('label') or ''
+                if 'superviseur' not in label.lower():
+                    continue
+                role_key = role.get('key')
+                if not role_key:
+                    continue
+                for slot_idx in range(role.get('slots', 1)):
+                    vals = affectations_map.get(f"{role_key}_{slot_idx}") or {}
+                    items = enumerate(vals) if isinstance(vals, list) else vals.items()
+                    for idx_key, value in items:
+                        try:
+                            v_idx = int(idx_key)
+                        except (TypeError, ValueError):
+                            continue
+                        if v_idx == date_idx and value:
+                            supervisor_names.add(value.strip())
+
+    all_target_names = supervisor_names | set(RETARD_ALWAYS_NOTIFY_NAMES)
+    recipient_ids = set()
+    if all_target_names:
+        lowered_targets = {n.strip().lower() for n in all_target_names}
+        async for u in db.users.find({}, {"_id": 0, "id": 1, "full_name": 1}):
+            uname = (u.get("full_name") or "").strip().lower()
+            if uname and uname in lowered_targets:
+                recipient_ids.add(u["id"])
+    if not recipient_ids:
+        # Filet de sécurité : personne résolu par nom -> prévenir Admin/Super Admin
+        recipient_ids = set(await get_user_ids_by_roles(["Super Admin", "Admin"]))
+
+    date_label = d.strftime("%d/%m/%Y")
+    msg = f"{current_user['full_name']} sera en retard le {date_label} ({day_type_found}), arrivée estimée vers {data.heure_estimee}."
+    if data.message:
+        msg += f" {data.message}"
+
+    await create_notification(list(recipient_ids), "retard", "Signalement de retard", msg, link="/planning")
+    await log_action(current_user['id'], current_user['full_name'], "Signalement de retard", f"{data.date} — {data.heure_estimee}")
+    return {"message": "Signalement envoyé", "notified": len(recipient_ids)}
+
 @api_router.get("/dashboard/member-brief")
 async def get_member_brief(current_user: dict = Depends(get_current_user)):
     """Personalized quick-info summary shown at the top of everyone's
@@ -3973,6 +4307,105 @@ async def get_member_brief(current_user: dict = Depends(get_current_user)):
     else:
         guests_status_text = f"Nous n'avons pas d'invités prochainement pour le mois de {current_month_name}."
 
+    # Détail structuré des invités du mois (pas seulement le compte) pour le
+    # widget Dashboard : titre de l'événement, date, nom de l'invité.
+    guests_detail = [
+        {
+            "titre": g.get('titre', ''),
+            "date_evenement": g['date_evenement'],
+            "invite_nom": g.get('invite_nom') or None,
+        }
+        for g in sorted(
+            [a for a in actualites if a.get('invite') and a.get('date_evenement') and a['date_evenement'].startswith(month_prefix)],
+            key=lambda a: a['date_evenement']
+        )
+    ]
+
+    # Données calendrier basique du Dashboard : jours de service (à partir du
+    # planning du mois en cours), événements Actualités globaux du mois,
+    # ainsi que les éléments PERSONNELS de l'utilisateur (ses absences
+    # déclarées, ses formations) pour que le calendrier affiche aussi bien
+    # ce qui concerne tout le monde que ce qui le/la concerne directement —
+    # tout en un seul appel, sans requête séparée par jour.
+    calendar_service_dates = []
+    if current_planning:
+        day_dates_map = current_planning.get('dates') or {}
+        for day_type in ['vendredi', 'dimanche']:
+            for date_str in (day_dates_map.get(day_type) or []):
+                if date_str.startswith(month_prefix):
+                    calendar_service_dates.append({"date": date_str, "jour": day_type})
+    calendar_events = [
+        {"date": a['date_evenement'], "titre": a.get('titre', ''), "invite": bool(a.get('invite')), "type": "evenement"}
+        for a in actualites
+        if a.get('date_evenement') and a['date_evenement'].startswith(month_prefix)
+    ]
+
+    # Mes absences déclarées qui tombent ce mois-ci — éclatées jour par jour
+    # (une absence peut être une plage) pour marquer chaque jour concerné.
+    my_absences_this_month = await db.absences.find(
+        {"user_id": current_user["id"]}, {"_id": 0}
+    ).to_list(500)
+    calendar_personal = []
+    for a in my_absences_this_month:
+        if not _dates_overlap(a["date_debut"], a["date_fin"], f"{month_prefix}-01", f"{month_prefix}-31"):
+            continue
+        try:
+            d = datetime.strptime(max(a["date_debut"], f"{month_prefix}-01"), "%Y-%m-%d").date()
+            d_end = datetime.strptime(min(a["date_fin"], f"{month_prefix}-31"), "%Y-%m-%d").date()
+        except ValueError:
+            continue
+        while d <= d_end:
+            calendar_personal.append({"date": d.strftime("%Y-%m-%d"), "titre": f"Absence — {a.get('raison', '')}".strip(' —'), "type": "absence"})
+            d += timedelta(days=1)
+
+    # Mes formations (demandées ou pour lesquelles j'ai marqué mon intérêt)
+    # dont une date souhaitée tombe ce mois-ci.
+    my_formations = await db.formations.find(
+        {
+            "is_archived": False,
+            "$or": [
+                {"created_by": current_user["id"]},
+                {"interested_members": current_user.get("full_name")},
+            ],
+        },
+        {"_id": 0, "titre": 1, "dates_souhaitees": 1, "statut": 1}
+    ).to_list(200)
+    for f in my_formations:
+        for date_str in (f.get("dates_souhaitees") or []):
+            if date_str.startswith(month_prefix):
+                calendar_personal.append({"date": date_str, "titre": f"Formation — {f.get('titre', '')} ({f.get('statut', '')})", "type": "formation"})
+
+    # Signalement de retard : le bouton ne doit apparaître côté frontend que
+    # si la fonctionnalité est activée par un Admin ET que l'utilisateur est
+    # bien planifié aujourd'hui (vérifié à nouveau côté serveur à l'envoi).
+    retard_settings = await get_retard_settings()
+    is_scheduled_today = False
+    today_service_type = None
+    if retard_settings.get("enabled") and current_planning:
+        day_dates_map = current_planning.get('dates') or {}
+        affectations_map = current_planning.get('affectations') or {}
+        for day_type in ['vendredi', 'dimanche']:
+            day_dates = day_dates_map.get(day_type) or []
+            if today_str not in day_dates:
+                continue
+            idx = day_dates.index(today_str)
+            for values in affectations_map.values():
+                if not values:
+                    continue
+                items = enumerate(values) if isinstance(values, list) else values.items()
+                for idx_key, value in items:
+                    try:
+                        v_idx = int(idx_key)
+                    except (TypeError, ValueError):
+                        continue
+                    if v_idx == idx and _name_matches(value):
+                        is_scheduled_today = True
+                        today_service_type = day_type
+                        break
+                if is_scheduled_today:
+                    break
+            break
+
     return {
         "upcoming_shifts": upcoming_shifts,
         "upcoming_events": [{"titre": e['titre'], "date_evenement": e['date_evenement']} for e in upcoming_events],
@@ -3980,6 +4413,14 @@ async def get_member_brief(current_user: dict = Depends(get_current_user)):
         "service_info_text": await get_service_info_text(),
         "service_status_text": service_status_text,
         "guests_status_text": guests_status_text,
+        "guests_detail": guests_detail,
+        "calendar_service_dates": calendar_service_dates,
+        "calendar_events": calendar_events,
+        "calendar_personal": calendar_personal,
+        "retard_enabled": retard_settings.get("enabled", False),
+        "retard_is_scheduled_today": is_scheduled_today,
+        "retard_today_service_type": today_service_type,
+        "retard_today_date": today_str,
     }
 
 # ==================== ORGANIGRAMME ====================
