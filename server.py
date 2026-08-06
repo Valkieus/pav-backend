@@ -4489,6 +4489,11 @@ async def get_member_brief(current_user: dict = Depends(get_current_user)):
     # l'église a un service (sinon la légende du calendrier ne veut plus rien
     # dire — même correspondance nom/affectation que upcoming_shifts).
     calendar_service_dates = []
+    # Trace de debug (Super Admin uniquement, cf. return) : pour chaque date
+    # marquée "de service", quelle clé/valeur de cellule a déclenché le
+    # match — permet de diagnostiquer un faux positif sans accès direct à la
+    # base de données.
+    calendar_service_debug = []
     if current_planning:
         day_dates_map = current_planning.get('dates') or {}
         affectations_map = current_planning.get('affectations') or {}
@@ -4498,7 +4503,8 @@ async def get_member_brief(current_user: dict = Depends(get_current_user)):
                 if not date_str.startswith(month_prefix):
                     continue
                 scheduled = False
-                for values in affectations_map.values():
+                matched_role_key, matched_value = None, None
+                for role_key, values in affectations_map.items():
                     if not values:
                         continue
                     items = enumerate(values) if isinstance(values, list) else values.items()
@@ -4509,11 +4515,13 @@ async def get_member_brief(current_user: dict = Depends(get_current_user)):
                             continue
                         if v_idx == idx and _name_matches(value):
                             scheduled = True
+                            matched_role_key, matched_value = role_key, value
                             break
                     if scheduled:
                         break
                 if scheduled:
                     calendar_service_dates.append({"date": date_str, "jour": day_type})
+                    calendar_service_debug.append({"date": date_str, "jour": day_type, "role_key": matched_role_key, "matched_value": matched_value})
     calendar_events = [
         {"date": a['date_evenement'], "titre": a.get('titre', ''), "invite": bool(a.get('invite')), "type": "evenement"}
         for a in actualites
@@ -4611,6 +4619,7 @@ async def get_member_brief(current_user: dict = Depends(get_current_user)):
         "retard_today_service_type": today_service_type,
         "retard_today_date": today_str,
         "test_mode_active": test_mode_active,
+        "calendar_service_debug": calendar_service_debug if current_user.get("niveau_acces") == "Super Admin" else None,
     }
 
 # ==================== ORGANIGRAMME ====================
