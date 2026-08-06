@@ -4464,12 +4464,35 @@ async def get_member_brief(current_user: dict = Depends(get_current_user)):
     # déclarées, ses formations) pour que le calendrier affiche aussi bien
     # ce qui concerne tout le monde que ce qui le/la concerne directement —
     # tout en un seul appel, sans requête séparée par jour.
+    # Corrigé : "Jour de service" doit refléter les jours où CETTE personne
+    # est personnellement planifiée, pas tous les vendredis/dimanches où
+    # l'église a un service (sinon la légende du calendrier ne veut plus rien
+    # dire — même correspondance nom/affectation que upcoming_shifts).
     calendar_service_dates = []
     if current_planning:
         day_dates_map = current_planning.get('dates') or {}
+        affectations_map = current_planning.get('affectations') or {}
         for day_type in ['vendredi', 'dimanche']:
-            for date_str in (day_dates_map.get(day_type) or []):
-                if date_str.startswith(month_prefix):
+            day_dates = day_dates_map.get(day_type) or []
+            for idx, date_str in enumerate(day_dates):
+                if not date_str.startswith(month_prefix):
+                    continue
+                scheduled = False
+                for values in affectations_map.values():
+                    if not values:
+                        continue
+                    items = enumerate(values) if isinstance(values, list) else values.items()
+                    for idx_key, value in items:
+                        try:
+                            v_idx = int(idx_key)
+                        except (TypeError, ValueError):
+                            continue
+                        if v_idx == idx and _name_matches(value):
+                            scheduled = True
+                            break
+                    if scheduled:
+                        break
+                if scheduled:
                     calendar_service_dates.append({"date": date_str, "jour": day_type})
     calendar_events = [
         {"date": a['date_evenement'], "titre": a.get('titre', ''), "invite": bool(a.get('invite')), "type": "evenement"}
