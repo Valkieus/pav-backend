@@ -3745,9 +3745,7 @@ async def get_planning_kpi_presence(mois: Optional[int] = None, annee: Optional[
             day_dates = day_dates_map.get(day_type) or []
             if not day_dates:
                 continue
-            for values in affectations_map.values():
-                if not values:
-                    continue
+            for role_key, values in _affectation_keys_for_day(affectations_map, day_type):
                 items = enumerate(values) if isinstance(values, list) else values.items()
                 for idx_key, value in items:
                     try:
@@ -4076,6 +4074,28 @@ async def update_service_info_text(data: ServiceInfoUpdate, current_user: dict =
 # exige maintenant soit une égalité stricte, soit que l'un des deux noms
 # (découpé en mots) soit ENTIÈREMENT inclus dans l'autre, mot par mot, avec
 # une longueur minimale pour éviter les collisions sur des mots trop courts.
+def _affectation_keys_for_day(affectations_map: dict, day_type: str):
+    """Racine du vrai bug calendrier/retard/KPI : les clés d'affectation
+    Dimanche n'ont PAS de préfixe et celles de Vendredi sont TOUTES
+    préfixées "v_" (cf. Planning.js, handleResetPlanningVierge — même
+    convention utilisée pour effacer un jour sans toucher l'autre). Les deux
+    jours ont des séquences d'index qui se chevauchent (0..4/5 chacune), donc
+    parcourir affectations_map SANS filtrer par ce préfixe fait lire, pour
+    Dimanche, des valeurs qui appartiennent en réalité à Vendredi au même
+    index (et vice versa) — d'où des gens marqués "de service" un jour où
+    ils ne travaillent que l'autre. Toute lecture d'affectations doit passer
+    par cette fonction, jamais itérer affectations_map.values()/.items()
+    directement pour un day_type donné."""
+    for role_key, values in (affectations_map or {}).items():
+        if not values:
+            continue
+        is_vendredi_key = role_key.startswith('v_')
+        if day_type == 'vendredi' and not is_vendredi_key:
+            continue
+        if day_type == 'dimanche' and is_vendredi_key:
+            continue
+        yield role_key, values
+
 def _name_matches_strict(target_name: str, value) -> bool:
     if not target_name or not value or not isinstance(value, str):
         return False
@@ -4244,9 +4264,7 @@ async def signal_retard(data: RetardCreate, current_user: dict = Depends(get_cur
         if data.date not in day_dates:
             continue
         idx = day_dates.index(data.date)
-        for values in affectations_map.values():
-            if not values:
-                continue
+        for role_key, values in _affectation_keys_for_day(affectations_map, day_type):
             items = enumerate(values) if isinstance(values, list) else values.items()
             for idx_key, value in items:
                 try:
@@ -4359,9 +4377,7 @@ async def get_member_brief(current_user: dict = Depends(get_current_user)):
             day_dates = dates.get(day_type) or []
             if not day_dates:
                 continue
-            for values in affectations.values():
-                if not values:
-                    continue
+            for role_key, values in _affectation_keys_for_day(affectations, day_type):
                 items = enumerate(values) if isinstance(values, list) else values.items()
                 for idx_key, value in items:
                     try:
@@ -4504,9 +4520,7 @@ async def get_member_brief(current_user: dict = Depends(get_current_user)):
                     continue
                 scheduled = False
                 matched_role_key, matched_value = None, None
-                for role_key, values in affectations_map.items():
-                    if not values:
-                        continue
+                for role_key, values in _affectation_keys_for_day(affectations_map, day_type):
                     items = enumerate(values) if isinstance(values, list) else values.items()
                     for idx_key, value in items:
                         try:
@@ -4577,9 +4591,7 @@ async def get_member_brief(current_user: dict = Depends(get_current_user)):
             if today_str not in day_dates:
                 continue
             idx = day_dates.index(today_str)
-            for values in affectations_map.values():
-                if not values:
-                    continue
+            for role_key, values in _affectation_keys_for_day(affectations_map, day_type):
                 items = enumerate(values) if isinstance(values, list) else values.items()
                 for idx_key, value in items:
                     try:
